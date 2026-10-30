@@ -63,6 +63,14 @@ cargo test
 
 包含 git 集成测试和 REST API 契约测试（含前端常用的空 body `POST /api/tasks/:id/cancel`）。
 
+## 验证状态（2026-10-30）
+
+- `cargo test`：4/4 通过（2 个 git 集成、2 个 API 契约）。
+- `cargo build --release`：通过；`devhub.exe` 约 **4.52 MB**，只依赖 Windows 系统 DLL（无 MinGW 运行时 DLL）。
+- 现有 `web/` 前端直接可用：会话列表、任务板、流程画布、负责人下拉、简单/高级模式、SSE「实时」状态均通过 headless Edge 验证。
+- 5 个 CLI 均能检测到；opencode 任务已实际 spawn、解析 JSONL、落日志，并按 429 错误正确置为 `failed`。
+- **尚未在 Rust 版跑通真实 agent 的 review/merge 全链路**：代码已移植，但需要一次成功的 dsh/opencode 任务来验证。Node 版此前已跑通 dsh + opencode 的完整链路，可作为对照。
+
 ## 与 Node 版的关系
 
 - `server/` 的 Node 版保留作为参考实现和回退方案。
