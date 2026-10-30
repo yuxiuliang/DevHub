@@ -20,5 +20,5 @@
 
 - 门禁 / 回边目前主要是流程标注，评审和合并仍在任务抽屉里手动操作。
 - 重启恢复、空产出判失败、合并冲突回流、全局停止、artifact 模型、按需检索 CLI、成本统计尚未实现。
-- Rust 版已完成 API/UI/SSE 和单任务执行验证；真实 agent 的 review/merge 全链路还需要一次成功任务来确认。
+- Rust 版已完成 API/UI/SSE 验证；单任务执行链路已验证 spawn/解析/日志/失败状态（opencode 因 provider 429 未产出改动）；真实 agent 的 review/merge 全链路还需要一次成功任务确认。
 - 仅 Windows；worktree 只隔离代码，不隔离网络和系统。

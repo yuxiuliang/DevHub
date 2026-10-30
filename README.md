@@ -7,6 +7,11 @@
 
 > 术语：界面上叫「会话」，代码和 API 里仍沿用 `room`。一个会话 = 一个需求 + 一组成员 + 一块任务看板。
 
+## 下载
+
+- [GitHub Releases v0.1.0](https://github.com/yuxiuliang/DevHub/releases/tag/v0.1.0)
+- Windows 单文件（Rust，实验）：`devhub.exe`，不需要 Node.js；校验和见 `SHA256SUMS.txt`。
+
 ## 快速开始
 
 ```bash
