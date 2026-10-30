@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DevHub · 多 agent 协作台</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="rail">
+      <div class="brand">
+        <div class="mark">DH</div>
+        <div class="brand-text">
+          <b>DevHub</b>
+          <span>多 agent 协作台</span>
+        </div>
+      </div>
+      <button class="btn primary block" id="btn-new-room" data-act="new-room">＋ 新建会话</button>
+      <div class="rail-label">会话 <button class="rail-toggle" id="btn-archived" data-act="toggle-archived">显示归档</button></div>
+      <div class="room-list" id="room-list"></div>
+      <div class="rail-foot">
+        <div class="rail-label">Worker</div>
+        <div class="worker-list" id="worker-list"></div>
+        <div class="rail-hint">检测自本机 PATH</div>
+      </div>
+    </aside>
+    <main id="main"></main>
+  </div>
+  <div id="modal-root"></div>
+  <div id="drawer-root"></div>
+  <div id="toast-root" class="toasts"></div>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

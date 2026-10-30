@@ -1,0 +1,15 @@
+{
+  "name": "devhub-local",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "本机单用户的多 agent 协作台：可编辑流程 + 共享上下文 + worktree 隔离 + 看板",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node --test",
+    "check": "node --check server/store.js && node --check server/git.js && node --check server/adapters.js && node --check server/prompts.js && node --check server/engine.js && node --check server/api.js && node --check server/index.js && node --check web/app.js"
+  }
+}

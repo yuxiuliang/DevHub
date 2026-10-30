@@ -1,0 +1,18 @@
+# 运行时数据：SQLite、日志、prompt、worktree、演示仓库
+.data/
+# 本地凭据（可能包含 API Key），永远不要提交
+.data/env.json
+node_modules/
+*.log
+agy-help.txt
+
+# 本地进度/审计记录（含本机路径与会话 ID），不提交
+PROGRESS.md
+
+# 常见本地密钥/证书
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
