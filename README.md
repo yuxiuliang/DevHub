@@ -17,6 +17,19 @@ node server/index.js
 
 要求：Node >= 22.5（用了内置 `node:sqlite`，不需要 `npm install`，没有任何第三方依赖），以及 `git`。
 
+## Rust 单文件版（实验）
+
+`rust/` 是用 Rust 重写的 hub，复用同一套 REST/SSE 契约和 `web/` 前端，目标是产出不需要 Node.js 的 `devhub.exe`：
+
+```powershell
+cd rust
+cargo build --release
+$env:DEVHUB_DATA = "D:\path\to\devhub-data"
+.\target\release\devhub.exe
+```
+
+细节、配置和已知限制见 [rust/README.md](rust/README.md)。Node 版保留作为参考实现和回退方案；两个版本不要同时写同一个 `.data/devhub.db`。
+
 ## 支持的 worker
 
 自动从 PATH 检测，检测不到会在左侧栏标灰：

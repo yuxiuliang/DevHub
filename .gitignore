@@ -6,6 +6,9 @@ node_modules/
 *.log
 agy-help.txt
 
+# Rust 构建产物
+rust/target/
+
 # 本地进度/审计记录（含本机路径与会话 ID），不提交
 PROGRESS.md
 
