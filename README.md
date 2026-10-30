@@ -9,7 +9,7 @@
 
 ## 下载
 
-- [GitHub Releases v0.1.0](https://github.com/yuxiuliang/DevHub/releases/tag/v0.1.0)
+- [GitHub Releases（最新）](https://github.com/yuxiuliang/DevHub/releases/latest)
 - Windows 单文件（Rust，实验）：`devhub.exe`，不需要 Node.js；校验和见 `SHA256SUMS.txt`。
 
 ## 快速开始
@@ -29,11 +29,10 @@ node server/index.js
 ```powershell
 cd rust
 cargo build --release
-$env:DEVHUB_DATA = "D:\path\to\devhub-data"
-.\target\release\devhub.exe
+.\target\release\devhub.exe --port 7374 --data D:\path\to\devhub-data
 ```
 
-细节、配置和已知限制见 [rust/README.md](rust/README.md)。Node 版保留作为参考实现和回退方案；两个版本不要同时写同一个 `.data/devhub.db`。
+`--port` 指定端口；不指定时先试 7373，被占用会自动尝试 7374–7399。细节、配置和已知限制见 [rust/README.md](rust/README.md)。Node 版保留作为参考实现和回退方案；两个版本不要同时写同一个 `.data/devhub.db`。
 
 ## 支持的 worker
 
