@@ -846,6 +846,7 @@ function eventText(e) {
     case 'room.completed': return '会话完成';
     case 'room.archived': return '会话已归档';
     case 'room.restored': return '会话已恢复';
+    case 'room.updated': return p.baseBranch ? `基准分支改为 ${p.baseBranch}` : '会话设置已更新';
     case 'room.recovered': return '服务重启，已暂停会话，可以继续执行';
     case 'task.interrupted': return '服务重启中断了任务，可以重新运行';
     case 'plan.started': return `Planner 开始生成计划 · ${p.planner || ''}`;

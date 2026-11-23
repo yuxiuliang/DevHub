@@ -353,8 +353,9 @@ async fn manual_rerun_states_work_in_draft_and_paused_rooms_and_prepare_errors_r
             let f = Fixture::new(false);
             f.single(room_status, task_status);
             let error = f.engine.start_task("T1").await.unwrap_err().to_string();
+            // 空仓库没有可解析的基准分支，准备阶段直接给出可操作的错误文案。
             assert!(
-                error.contains("准备工作区失败"),
+                error.contains("无法确定基准分支"),
                 "{room_status}/{task_status}: {error}"
             );
             assert_eq!(f.status("T1"), "failed");
@@ -385,7 +386,7 @@ async fn completed_dependencies_allow_manual_execution() {
             .await
             .unwrap_err()
             .to_string()
-            .contains("准备工作区失败"));
+            .contains("无法确定基准分支"));
         assert_eq!(f.runs().len(), 1);
     }
 }
@@ -805,3 +806,51 @@ async fn dropping_the_request_does_not_abandon_its_reservation() {
     assert_eq!(f.runs()[0].0, "completed");
     assert!(f.runs()[0].2.is_some());
 }
+
+#[tokio::test]
+async fn stale_base_branch_falls_back_to_current_branch_and_is_persisted() {
+    let f = Fixture::new(true);
+    f.single("running", "ready");
+    f.worker("", 0);
+    f.store
+        .db
+        .lock()
+        .unwrap()
+        .execute("UPDATE rooms SET base_branch='master' WHERE id='r1'", [])
+        .unwrap();
+    f.engine.start_task("T1").await.unwrap();
+    f.idle().await;
+    assert_eq!(f.status("T1"), "done");
+    assert_eq!(
+        f.store.room("r1").unwrap().unwrap().base_branch,
+        "main",
+        "the stored branch must be repaired before the task starts"
+    );
+    let task = f.store.task("T1").unwrap().unwrap();
+    assert!(!task.worktree.is_empty());
+    assert!(!task.base_sha.is_empty());
+    let payload: String = f
+        .store
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT payload FROM events WHERE type='room.updated' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(payload.contains("\"baseBranch\":\"main\""), "{payload}");
+    assert!(payload.contains("\"previous\":\"master\""), "{payload}");
+}
+
+#[tokio::test]
+async fn unresolvable_base_branch_reports_actionable_error_without_worktree() {
+    let f = Fixture::new(false);
+    f.single("running", "ready");
+    let error = f.engine.start_task("T1").await.unwrap_err().to_string();
+    assert!(error.contains("无法确定基准分支"), "{error}");
+    assert_eq!(f.status("T1"), "failed");
+    assert_eq!(std::fs::read_dir(&f.store.worktrees).unwrap().count(), 0);
+}
+

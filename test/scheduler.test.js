@@ -84,7 +84,8 @@ async function createHarness({ rooms = [{}], members = [{}], tasks = [{}], hooks
     defaultFlow: () => ({ nodes: [] }), starterFlow: () => ({ nodes: [] }), WORKTREES: 'mock-worktrees',
   };
   const git = {
-    currentBranch: async () => 'main', revParse: async () => 'base',
+    currentBranch: async () => hooks.currentBranch ? await hooks.currentBranch() : 'main',
+    revParse: async (repo, ref) => hooks.revParse ? await hooks.revParse(repo, ref) : 'base',
     commitSha: async (repo, ref) => {
       state.resultCalls.push({ repo, ref });
       if (hooks.resolve) return await hooks.resolve(repo, ref);

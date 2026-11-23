@@ -53,6 +53,18 @@ impl std::fmt::Display for TaskStartBlocked {
 
 impl std::error::Error for TaskStartBlocked {}
 
+/// 基准分支不可用时的错误：文案已经自解释，外层不再加「准备工作区失败」前缀。
+#[derive(Debug)]
+struct BaseBranchError(String);
+
+impl std::fmt::Display for BaseBranchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BaseBranchError {}
+
 #[derive(Debug)]
 pub struct ResultConflict(pub String);
 
@@ -284,6 +296,13 @@ impl Engine {
         } else {
             base_branch
         };
+        // 空仓库（还没有任何提交）会在第一次运行才失败，建会话时就明确拒绝更好。
+        if git::rev_parse(&repo_path, &base_branch).await.is_err() {
+            bail!(
+                "仓库的基准分支「{}」还不能解析成提交：请确认仓库至少有一次提交，或换一个项目",
+                base_branch
+            );
+        }
         let room_id = uid("r");
         let ts = now();
 
@@ -1506,12 +1525,56 @@ impl Engine {
         if !task.worktree.is_empty() && std::path::Path::new(&task.worktree).join(".git").exists() {
             return Ok(task.worktree.clone());
         }
-        let base = if room.base_branch.is_empty() {
+        let configured = room.base_branch.clone();
+        let mut base = if configured.is_empty() {
             git::current_branch(&room.repo_path).await
         } else {
-            room.base_branch.clone()
+            configured.clone()
         };
-        let sha = git::rev_parse(&room.repo_path, &base).await?;
+        let sha = match git::rev_parse(&room.repo_path, &base).await {
+            Ok(sha) => sha,
+            Err(_) => {
+                // 旧会话可能记着已经不存在或改名的基准分支（例如仓库从 main 改成 master）。
+                let detected = git::current_branch(&room.repo_path).await;
+                if detected.is_empty() || detected == base {
+                    return Err(BaseBranchError(format!(
+                        "无法确定基准分支：会话记录的是「{}」，仓库当前分支是「{}」。请确认仓库已有提交，或新建会话重新选择项目",
+                        base,
+                        if detected.is_empty() { "未知" } else { detected.as_str() }
+                    ))
+                    .into());
+                }
+                let fallback = match git::rev_parse(&room.repo_path, &detected).await {
+                    Ok(sha) => sha,
+                    Err(_) => {
+                        return Err(BaseBranchError(format!(
+                            "无法确定基准分支：会话记录的是「{}」，仓库当前分支「{}」也无法解析。请确认仓库已有提交",
+                            base, detected
+                        ))
+                        .into())
+                    }
+                };
+                {
+                    let conn = self.store.db.lock().unwrap();
+                    conn.execute(
+                        "UPDATE rooms SET base_branch=?, updated_at=? WHERE id=?",
+                        params![&detected, now(), &room.id],
+                    )?;
+                }
+                let previous = base.clone();
+                self.store.emit(
+                    Some(&room.id),
+                    Some(&task.id),
+                    None,
+                    "room.updated",
+                    json!({
+                        "keys": ["base_branch"], "baseBranch": &detected, "previous": &previous,
+                    }),
+                );
+                base = detected;
+                fallback
+            }
+        };
         let wt = self.store.worktrees.join(&room.id).join(&task.id);
         let wt_s = wt.to_string_lossy().to_string();
         let suffix = if task.id.len() > 6 {
@@ -1783,7 +1846,11 @@ impl Engine {
                     "collecting" => "收集改动失败，请检查工作区和 Git 错误后重试",
                     _ => "启动或执行失败，请检查 CLI 配置和日志后重试",
                 };
-                let message = format!("{}：{}", action, error);
+                let message = if error.downcast_ref::<BaseBranchError>().is_some() {
+                    error.to_string()
+                } else {
+                    format!("{}：{}", action, error)
+                };
                 self.update_run(&holder.run_id, "failed", result, &message)?;
                 self.set_status(task_id, "failed", &[("summary", message.clone())])?;
                 self.store.emit(

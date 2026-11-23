@@ -134,6 +134,12 @@ export async function createRoom(input) {
   if (!repoPath) throw new Error('请填写仓库路径');
   if (!(await G.isRepo(repoPath))) throw new Error(`不是 git 仓库：${repoPath}`);
   const base = input.baseBranch || (await G.currentBranch(repoPath));
+  // 空仓库（还没有任何提交）会在第一次运行才失败，建会话时就明确拒绝更好。
+  try {
+    await G.revParse(repoPath, base);
+  } catch {
+    throw new Error(`仓库的基准分支「${base}」还不能解析成提交：请确认仓库至少有一次提交，或换一个项目`);
+  }
   const roomId = uid('r');
   const ts = now();
   const members = Array.isArray(input.members) && input.members.length
@@ -870,10 +876,34 @@ export function schedule() {
   }
 }
 
+function baseBranchError(message) {
+  const error = new Error(message);
+  error.code = 'BASE_BRANCH';
+  return error;
+}
+
 async function ensureWorktree(task, room) {
   if (task.worktree && existsSync(join(task.worktree, '.git'))) return task.worktree;
-  const base = room.base_branch || (await G.currentBranch(room.repo_path));
-  const sha = await G.revParse(room.repo_path, base);
+  const configured = room.base_branch || '';
+  let base = configured || (await G.currentBranch(room.repo_path));
+  let sha;
+  try {
+    sha = await G.revParse(room.repo_path, base);
+  } catch {
+    // 旧会话可能记着已经不存在或改名的基准分支（例如仓库从 main 改成 master）。
+    const detected = await G.currentBranch(room.repo_path);
+    if (!detected || detected === base) {
+      throw baseBranchError(`无法确定基准分支：会话记录的是「${base}」，仓库当前分支是「${detected || '未知'}」。请确认仓库已有提交，或新建会话重新选择项目`);
+    }
+    try {
+      sha = await G.revParse(room.repo_path, detected);
+    } catch {
+      throw baseBranchError(`无法确定基准分支：会话记录的是「${base}」，仓库当前分支「${detected}」也无法解析。请确认仓库已有提交`);
+    }
+    base = detected;
+    run('UPDATE rooms SET base_branch=?, updated_at=? WHERE id=?', [base, now(), room.id]);
+    emit(room.id, task.id, null, 'room.updated', { keys: ['base_branch'], baseBranch: base, previous: configured });
+  }
   const wt = join(WORKTREES, room.id, task.id);
   const branch = `devhub/${room.id}/${task.key}-${task.id.slice(-6)}`;
   await G.addWorktree(room.repo_path, wt, branch, sha);
@@ -1002,10 +1032,11 @@ export async function startTask(taskId, { automatic = false } = {}) {
     holder.pid = 0;
     if (cancelled()) return finishCancelled();
     if (error instanceof TaskStartBlockedError) throw error;
-    const action = holder.phase === 'starting' ? '准备工作区失败，请检查仓库路径和基准分支后重试'
-      : holder.phase === 'collecting' ? '收集改动失败，请检查工作区和 Git 错误后重试'
-        : '启动或执行失败，请检查 CLI 配置和日志后重试';
-    const message = `${action}：${String(error.message || error)}`;
+    const action = error.code === 'BASE_BRANCH' ? String(error.message)
+      : holder.phase === 'starting' ? '准备工作区失败，请检查仓库路径和基准分支后重试'
+        : holder.phase === 'collecting' ? '收集改动失败，请检查工作区和 Git 错误后重试'
+          : '启动或执行失败，请检查 CLI 配置和日志后重试';
+    const message = error.code === 'BASE_BRANCH' ? action : `${action}：${String(error.message || error)}`;
     finishRun('failed', message);
     if (ownsRunningTask()) setStatus(taskId, 'failed', { summary: message });
     emit(room.id, taskId, runId, 'task.error', { error: message });
