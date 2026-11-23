@@ -106,27 +106,53 @@ fn get_worker_path(store: &Store, key: &str) -> String {
     key.to_string()
 }
 
-fn cmd_quote(s: &str) -> String {
-    let v = s.replace('"', "");
-    if v.is_empty() {
-        return "\"\"".to_string();
+fn cmd_quote(s: &str) -> Result<String> {
+    if s.chars().any(|c| c.is_control() || c == '"' || c == '%') {
+        anyhow::bail!("Windows 批处理路径或参数不支持引号、百分号及控制字符");
     }
-    if !v
-        .chars()
-        .any(|c| c.is_whitespace() || "&|<>^()%!".contains(c))
-    {
-        return v;
-    }
-    format!("\"{}\"", v)
+    // npm shims forward %* to a native executable; double trailing backslashes
+    // so its argv parser retains the closing quote and original argument.
+    let trailing = s.chars().rev().take_while(|c| *c == '\\').count();
+    Ok(format!("\"{}{}\"", s, "\\".repeat(trailing)))
 }
 
 fn write_launcher(store: &Store, run_id: &str, exe: &str, args: &[String]) -> Result<PathBuf> {
     let file = store.prompts.join(format!("{}.cmd", run_id));
-    let mut parts = vec![cmd_quote(exe)];
-    parts.extend(args.iter().map(|a| cmd_quote(a)));
+    cmd_quote(&file.to_string_lossy())?;
+    let mut parts = vec![cmd_quote(exe)?];
+    parts.extend(
+        args.iter()
+            .map(|a| cmd_quote(a))
+            .collect::<Result<Vec<_>>>()?,
+    );
     let line = parts.join(" ");
-    std::fs::write(&file, format!("@echo off\r\n{}\r\n", line))?;
+    std::fs::write(
+        &file,
+        format!(
+            "@echo off\r\nsetlocal DisableDelayedExpansion\r\nchcp 65001 >nul\r\n{}\r\n",
+            line
+        ),
+    )?;
     Ok(file)
+}
+
+fn worker_command(store: &Store, run_id: &str, exe: &str, args: &[String]) -> Result<Command> {
+    if cfg!(windows) && !exe.to_ascii_lowercase().ends_with(".exe") {
+        let launcher = write_launcher(store, run_id, exe, args)?;
+        let mut cmd = Command::new(std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into()));
+        cmd.args(["/d", "/s", "/v:off", "/c"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.as_std_mut()
+                .raw_arg(format!("\"\"{}\"\"", launcher.to_string_lossy()));
+        }
+        Ok(cmd)
+    } else {
+        let mut cmd = Command::new(exe);
+        cmd.args(args);
+        Ok(cmd)
+    }
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -637,7 +663,11 @@ async fn read_stream<R: AsyncRead + Unpin>(
                         a.stderr.push_str(&raw);
                         a.stderr.push('\n');
                         if a.stderr.len() > 4000 {
-                            let keep = a.stderr.len() - 4000;
+                            let mut keep = a.stderr.len() - 4000;
+                            // Discard only whole characters while keeping the tail within 4000 bytes.
+                            while !a.stderr.is_char_boundary(keep) {
+                                keep += 1;
+                            }
                             a.stderr = a.stderr.split_off(keep);
                         }
                         a.last_activity = brief(&Value::String(raw.clone()), 120);
@@ -691,14 +721,7 @@ pub async fn run_worker(opts: WorkerOpts) -> Result<WorkerResult> {
         &opts.model,
         opts.auto_approve,
     );
-    let launcher = write_launcher(&opts.store, &opts.run_id, &exe, &args)?;
-
-    let mut cmd = Command::new(if cfg!(windows) { "cmd.exe" } else { "sh" });
-    if cfg!(windows) {
-        cmd.arg("/d").arg("/c").arg(&launcher);
-    } else {
-        cmd.arg(&launcher);
-    }
+    let mut cmd = worker_command(&opts.store, &opts.run_id, &exe, &args)?;
     cmd.current_dir(&opts.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -823,5 +846,430 @@ pub fn kill_tree(pid: u32) {
         let _ = std::process::Command::new("kill")
             .args(["-TERM", &pid.to_string()])
             .output();
+    }
+}
+
+#[cfg(test)]
+mod stderr_tests {
+    use super::*;
+
+    async fn collect(input: &str) -> String {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let acc = Arc::new(Mutex::new(Acc::default()));
+        read_stream(
+            input.as_bytes(),
+            "err",
+            store.clone(),
+            "codex".into(),
+            None,
+            None,
+            "stderr-test".into(),
+            None,
+            store.logs.join("stderr-test.log"),
+            acc.clone(),
+        )
+        .await;
+        let stderr = acc.lock().unwrap().stderr.clone();
+        stderr
+    }
+
+    #[tokio::test]
+    async fn stderr_tail_preserves_complete_characters_at_the_byte_limit() {
+        let samples = [
+            ("a".repeat(3998), format!("{}\n", "a".repeat(3998))),
+            ("a".repeat(3999), format!("{}\n", "a".repeat(3999))),
+            ("a".repeat(4000), format!("{}\n", "a".repeat(3999))),
+            ("a".repeat(4001), format!("{}\n", "a".repeat(3999))),
+            ("错".repeat(1333), format!("{}\n", "错".repeat(1333))),
+            (
+                format!("{}a", "错".repeat(1400)),
+                format!("{}a\n", "错".repeat(1332)),
+            ),
+            ("é".repeat(2100), format!("{}\n", "é".repeat(1999))),
+            ("💥".repeat(1100), format!("{}\n", "💥".repeat(999))),
+            ("中文💥".repeat(450), format!("文💥{}\n", "中文💥".repeat(399))),
+        ];
+        for (line, expected) in samples {
+            let stderr = collect(&format!("{line}\n")).await;
+            assert_eq!(stderr, expected, "input length {}", line.len());
+            assert!(stderr.len() <= 4000);
+        }
+    }
+
+    #[tokio::test]
+    async fn stderr_tail_keeps_recent_multiline_diagnostics_and_full_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let acc = Arc::new(Mutex::new(Acc::default()));
+        let mut input = (0..150)
+            .map(|n| format!("诊断 {n}: 中文💥é\n"))
+            .collect::<String>();
+        input.push_str(&format!("{}\n", "中文💥".repeat(500)));
+        input.push_str("最终错误：权限不足 💥\n");
+        let log = store.logs.join("multiline.log");
+        let mut events = store.subscribe();
+        read_stream(
+            input.as_bytes(),
+            "err",
+            store,
+            "codex".into(),
+            None,
+            None,
+            "multiline".into(),
+            None,
+            log.clone(),
+            acc.clone(),
+        )
+        .await;
+        let acc = acc.lock().unwrap();
+        assert!(acc.stderr.len() <= 4000);
+        assert!(acc.stderr.ends_with("最终错误：权限不足 💥\n"));
+        assert!(!acc.stderr.contains("诊断 0:"));
+        assert_eq!(acc.last_activity, "最终错误：权限不足 💥");
+        let mut count = 0;
+        while events.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, input.lines().count());
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            input.lines().map(|line| format!("err{line}\n")).collect::<String>(),
+        );
+    }
+
+    #[tokio::test]
+    async fn nonzero_worker_exit_returns_unicode_error_after_long_stderr() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("data")).unwrap();
+        let script = temp.path().join(if cfg!(windows) {
+            "stderr-worker.cmd"
+        } else {
+            "stderr-worker.sh"
+        });
+        let long_line = "💥".repeat(1100);
+        let final_error = "最终错误：权限不足 💥";
+        std::fs::write(
+            temp.path().join("stderr.txt"),
+            format!("{long_line}\n{final_error}\n"),
+        )
+        .unwrap();
+        let body = if cfg!(windows) {
+            "@echo off\r\ntype stderr.txt 1>&2\r\nexit /b 17\r\n"
+        } else {
+            "#!/bin/sh\ncat stderr.txt >&2\nexit 17\n"
+        };
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::write(
+            store.data.join("env.json"),
+            json!({"DEVHUB_CODEX_PATH":script}).to_string(),
+        )
+        .unwrap();
+        let result = run_worker(WorkerOpts {
+            store: store.clone(),
+            worker: "codex".into(),
+            model: String::new(),
+            auto_approve: false,
+            cwd: temp.path().to_string_lossy().to_string(),
+            prompt: "Only emit fixture stderr.".into(),
+            run_id: "stderr-worker".into(),
+            room_id: None,
+            task_id: None,
+            actor: None,
+            timeout: Duration::from_secs(10),
+            pid_slot: Arc::new(Mutex::new(None)),
+            cancel: Arc::new(AtomicBool::new(false)),
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.code, 17);
+        assert_eq!(result.error, final_error);
+        assert!(std::fs::read_to_string(result.log_path)
+            .unwrap()
+            .contains(&long_line));
+    }
+}
+
+#[cfg(test)]
+mod launcher_tests {
+    use super::*;
+
+    #[test]
+    fn batch_validator_rejects_unsupported_characters_without_execution() {
+        for c in [
+            '"', '%', '\r', '\n', '\0', '\t', '\u{1f}', '\u{7f}', '\u{85}',
+        ] {
+            assert!(cmd_quote(&format!("label{}", c)).is_err());
+        }
+        assert_eq!(cmd_quote("").unwrap(), "\"\"");
+        assert_eq!(cmd_quote("普通 label").unwrap(), "\"普通 label\"");
+    }
+
+    #[test]
+    fn all_worker_model_and_permission_flags_remain_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("flags-data")).unwrap();
+        let variants: &[(&str, &[&str], &[&str])] = &[
+            (
+                "claude",
+                &[
+                    "-p",
+                    "instruction",
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                    "--permission-mode",
+                    "acceptEdits",
+                    "--permission-prompts",
+                    "none",
+                    "--model",
+                    "model",
+                ],
+                &[
+                    "-p",
+                    "instruction",
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                    "--permission-mode",
+                    "bypassPermissions",
+                    "--model",
+                    "model",
+                ],
+            ),
+            (
+                "codex",
+                &[
+                    "exec",
+                    "--json",
+                    "--skip-git-repo-check",
+                    "-s",
+                    "workspace-write",
+                    "-m",
+                    "model",
+                    "instruction",
+                ],
+                &[
+                    "exec",
+                    "--json",
+                    "--skip-git-repo-check",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "-m",
+                    "model",
+                    "instruction",
+                ],
+            ),
+            (
+                "opencode",
+                &["run", "--format", "json", "--model", "model", "instruction"],
+                &[
+                    "run",
+                    "--format",
+                    "json",
+                    "--auto",
+                    "--model",
+                    "model",
+                    "instruction",
+                ],
+            ),
+            (
+                "agy",
+                &[
+                    "-p",
+                    "instruction",
+                    "--output-format",
+                    "stream-json",
+                    "--model",
+                    "model",
+                ],
+                &[
+                    "-p",
+                    "instruction",
+                    "--output-format",
+                    "stream-json",
+                    "--dangerously-skip-permissions",
+                    "--model",
+                    "model",
+                ],
+            ),
+            (
+                "dsh",
+                &["--profile", "headless", "--json", "instruction"],
+                &["--profile", "headless", "--json", "instruction"],
+            ),
+        ];
+        for (worker, conservative, automatic) in variants {
+            for (auto_approve, expected) in [(false, *conservative), (true, *automatic)] {
+                let (_, args) = build_command(&store, worker, "instruction", "model", auto_approve);
+                assert_eq!(
+                    args,
+                    expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    "{worker}"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn native_fixture(root: &Path) -> PathBuf {
+        let install = root.join("Program Files 模拟安装");
+        std::fs::create_dir_all(&install).unwrap();
+        let source = install.join("fixture.rs");
+        let exe = install.join("fixture.exe");
+        // This stand-in only captures argv/cwd and emits a fixed JSON response.
+        // It does not read the prompt or launch any installed CLI.
+        std::fs::write(&source, r###"
+            fn main() {
+                let capture = std::path::PathBuf::from(std::env::var_os("DEVHUB_LAUNCHER_CAPTURE").unwrap());
+                let args = std::env::args().skip(1).collect::<Vec<_>>();
+                std::fs::write(&capture, args.join("\0")).unwrap();
+                std::fs::write(capture.with_extension("cwd"), std::env::current_dir().unwrap().to_string_lossy().as_bytes()).unwrap();
+                println!("{}", r##"{"type":"item.completed","item":{"type":"agent_message","text":"fixture-ok"}}"##);
+            }
+        "###).unwrap();
+        let mut compile =
+            std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
+        compile
+            .arg("--edition=2021")
+            .arg(&source)
+            .arg("-o")
+            .arg(&exe);
+        if cfg!(target_env = "gnu") {
+            compile.args([
+                "--target",
+                &format!("{}-pc-windows-gnu", std::env::consts::ARCH),
+            ]);
+        }
+        let output = compile.output().expect("compile benign argv fixture");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        exe
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_native_and_batch_launchers_preserve_unicode_paths_and_argv() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("数据 目录")).unwrap();
+        let cwd = temp.path().join("工作 目录");
+        std::fs::create_dir(&cwd).unwrap();
+        let exe = native_fixture(temp.path());
+        let shim = exe.with_extension("cmd");
+        std::fs::write(&shim, "@echo off\r\n@\"%~dp0fixture.exe\" %*\r\n").unwrap();
+        for (i, executable) in [&exe, &shim].into_iter().enumerate() {
+            let capture = temp.path().join(format!("argv-{i}.capture"));
+            std::fs::write(
+                store.data.join("env.json"),
+                json!({
+                    "DEVHUB_CODEX_PATH": executable,
+                    "DEVHUB_LAUNCHER_CAPTURE": capture,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let result = run_worker(WorkerOpts {
+                store: store.clone(),
+                worker: "codex".into(),
+                model: "模型 alpha".into(),
+                auto_approve: false,
+                cwd: cwd.to_string_lossy().into_owned(),
+                prompt: "测试需求：仅模拟，不执行真实任务。".into(),
+                run_id: format!("fixture-{i}"),
+                room_id: None,
+                task_id: None,
+                actor: None,
+                timeout: Duration::from_secs(10),
+                pid_slot: Arc::new(Mutex::new(None)),
+                cancel: Arc::new(AtomicBool::new(false)),
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.code, 0, "{}", result.error);
+            assert_eq!(result.text, "fixture-ok");
+            let args = std::fs::read_to_string(&capture).unwrap();
+            let expected = [
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "-s",
+                "workspace-write",
+                "-m",
+                "模型 alpha",
+                &format!(
+                    "Read the task file at {} and carry it out exactly. Do not ask questions.",
+                    result.prompt_path
+                ),
+            ]
+            .join("\0");
+            assert_eq!(args, expected);
+            assert_eq!(
+                std::fs::read_to_string(capture.with_extension("cwd")).unwrap(),
+                cwd.to_string_lossy()
+            );
+            assert_eq!(
+                std::fs::read_to_string(&result.prompt_path).unwrap(),
+                "测试需求：仅模拟，不执行真实任务。"
+            );
+            assert_eq!(
+                store.prompts.join(format!("fixture-{i}.cmd")).exists(),
+                i == 1
+            );
+
+            let labels = [
+                "",
+                "中文 label",
+                "C:\\folder with spaces\\",
+                "R&D (next) !literal!",
+                "caret^label",
+            ]
+            .map(String::from);
+            let mut cmd = worker_command(
+                &store,
+                &format!("labels-{i}"),
+                &executable.to_string_lossy(),
+                &labels,
+            )
+            .unwrap();
+            cmd.current_dir(&cwd)
+                .env("DEVHUB_LAUNCHER_CAPTURE", &capture);
+            let output = tokio::time::timeout(Duration::from_secs(10), cmd.output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(&capture).unwrap(),
+                labels.join("\0")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_windows_uses_executable_argv_without_a_windows_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path().join("数据 目录")).unwrap();
+        let fixture = temp.path().join("mock cli.sh");
+        std::fs::write(&fixture, "#!/bin/sh\nprintf '%s\\0' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let args = ["", "中文 label", "C:\\folder with spaces\\"].map(String::from);
+        let mut cmd = worker_command(&store, "posix", &fixture.to_string_lossy(), &args).unwrap();
+        let output = cmd.output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, format!("{}\0", args.join("\0")).as_bytes());
+        assert!(!store.prompts.join("posix.cmd").exists());
     }
 }

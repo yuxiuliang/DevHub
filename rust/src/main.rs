@@ -127,7 +127,8 @@ async fn main() -> anyhow::Result<()> {
                 .join(".data")
         });
     let data = std::path::absolute(&data).context("解析数据目录失败")?;
-    let store = Store::open(data.clone()).context("打开数据目录失败")?;
+    let store = Store::open(data.clone())
+        .with_context(|| format!("打开数据目录或恢复上次执行失败：{}", data.display()))?;
     let engine = Engine::new(store);
     let app = devhub::api::router(engine);
 

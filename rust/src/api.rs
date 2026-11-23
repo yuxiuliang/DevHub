@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::{
     body::Body,
     extract::{Path, Query, State},
@@ -22,7 +23,11 @@ use crate::assets::Assets;
 use crate::engine::Engine;
 use crate::flow::flow_template_list;
 use crate::fs::browse_dir;
+use crate::inbox;
+use crate::inputs::{self, TaskInputs};
+use crate::logs::{self, TaskLog};
 use crate::models::now;
+use crate::settings::SettingsError;
 
 #[derive(Debug)]
 pub struct AppError {
@@ -51,7 +56,18 @@ impl IntoResponse for AppError {
 
 impl From<anyhow::Error> for AppError {
     fn from(value: anyhow::Error) -> Self {
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, value.to_string())
+        let status = if let Some(error) = value.downcast_ref::<SettingsError>() {
+            StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+        } else if let Some(error) = value.downcast_ref::<crate::engine::TaskCreationError>() {
+            StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+        } else if value.is::<crate::engine::ResultConflict>() {
+            StatusCode::CONFLICT
+        } else if value.is::<inputs::InputsError>() {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        Self::new(status, value.to_string())
     }
 }
 
@@ -68,12 +84,14 @@ pub fn router(engine: Engine) -> Router {
         .route("/api/events", get(events))
         .route("/api/fs", get(fs_browse))
         .route("/api/state", get(state))
+        .route("/api/stop-all", post(stop_all))
         .route("/api/rooms", post(create_room))
         .route(
             "/api/rooms/{id}",
             get(get_room).patch(patch_room).delete(delete_room),
         )
         .route("/api/rooms/{id}/members", post(add_member))
+        .route("/api/rooms/{id}/settings", get(get_settings).patch(patch_settings))
         .route(
             "/api/members/{id}",
             axum::routing::patch(update_member).delete(delete_member),
@@ -88,6 +106,7 @@ pub fn router(engine: Engine) -> Router {
         .route("/api/tasks/{id}/{action}", post(task_action))
         .route("/api/tasks/{id}/diff", get(task_diff))
         .route("/api/tasks/{id}/log", get(task_log))
+        .route("/api/tasks/{id}/prompt", get(task_inputs))
         .route("/api/decisions", post(add_decision))
         .fallback(static_handler)
         .with_state(engine)
@@ -130,8 +149,14 @@ async fn state(State(engine): State<Engine>) -> Result<Json<Value>, AppError> {
     Ok(Json(json!({
         "rooms": engine.list_rooms()?,
         "running": engine.running_tasks().await,
+        "activeWorkers": engine.active_worker_count(),
         "flowTemplates": flow_template_list(),
+        "inbox": inbox::list(&engine.store)?,
     })))
+}
+
+async fn stop_all(State(engine): State<Engine>) -> Result<Json<Value>, AppError> {
+    Ok(Json(json!({ "stopped": engine.stop_all().await? })))
 }
 
 async fn create_room(
@@ -150,6 +175,21 @@ async fn get_room(
         .await?
         .map(Json)
         .ok_or_else(|| AppError::not_found("房间不存在"))
+}
+
+async fn get_settings(
+    State(engine): State<Engine>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    Ok(Json(crate::settings::read(&engine.store, &id).map_err(anyhow::Error::from)?))
+}
+
+async fn patch_settings(
+    State(engine): State<Engine>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    Ok(Json(engine.save_room_settings(&id, &body).await?))
 }
 
 async fn patch_room(
@@ -242,8 +282,10 @@ async fn restore_room(
 
 async fn create_task(
     State(engine): State<Engine>,
-    Json(body): Json<Value>,
+    body: axum::body::Bytes,
 ) -> Result<Json<Value>, AppError> {
+    let body: Value = serde_json::from_slice(&body)
+        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "任务内容必须是合法 JSON 对象"))?;
     let id = engine.create_task(&body)?;
     Ok(Json(json!({ "id": id })))
 }
@@ -258,10 +300,25 @@ async fn task_action(
     } else {
         serde_json::from_slice(&body).unwrap_or_else(|_| json!({}))
     };
+    let expected_result = if ["review", "merge"].contains(&action.as_str()) {
+        match body.get("resultSha") {
+            Some(Value::String(sha)) => Some(sha.clone()),
+            Some(_) => {
+                return Err(AppError::new(
+                    StatusCode::CONFLICT,
+                    "任务成果已更新，请刷新 Diff 并重新确认后再操作",
+                ))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     match action.as_str() {
         "run" => Ok(Json(engine.start_task(&id).await?)),
-        "review" => Ok(Json(engine.review_task(&id).await?)),
-        "merge" => Ok(Json(engine.merge_task(&id).await?)),
+        "review" => Ok(Json(engine.review_task_result(&id, expected_result).await?)),
+        "approve" => Ok(Json(engine.approve_task(&id)?)),
+        "merge" => Ok(Json(engine.merge_task_result(&id, expected_result).await?)),
         "reject" => {
             engine.reject_task(&id, body.get("note").and_then(Value::as_str).unwrap_or(""))?;
             Ok(Json(json!({ "ok": true })))
@@ -278,12 +335,35 @@ async fn task_action(
     }
 }
 
-async fn task_diff(State(engine): State<Engine>, Path(id): Path<String>) -> Json<Value> {
-    Json(json!({ "diff": engine.task_diff(&id).await }))
+async fn task_diff(
+    State(engine): State<Engine>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    Ok(Json(engine.task_diff(&id).await?))
 }
 
-async fn task_log(State(engine): State<Engine>, Path(id): Path<String>) -> Json<Value> {
-    Json(json!({ "log": engine.task_log(&id) }))
+async fn task_log(
+    State(engine): State<Engine>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskLog>, AppError> {
+    let store = engine.store.clone();
+    let log = tokio::task::spawn_blocking(move || logs::latest(&store, &id))
+        .await
+        .context("查询任务日志记录失败")??;
+    Ok(Json(log))
+}
+
+async fn task_inputs(
+    State(engine): State<Engine>,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<TaskInputs>, AppError> {
+    let selected = query.get("runId").cloned();
+    let store = engine.store.clone();
+    let inputs = tokio::task::spawn_blocking(move || inputs::read(&store, &id, selected.as_deref()))
+        .await
+        .context("读取任务执行输入失败")??;
+    Ok(Json(inputs))
 }
 
 async fn add_decision(

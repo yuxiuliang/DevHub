@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
@@ -12,6 +13,10 @@ use crate::models::{
     member_payload, now, room_payload, safe_json, task_payload, Decision, Member, Review, Room,
     Task,
 };
+
+const INTERRUPTED: &str = "DevHub 重启中断了上次运行。请检查工作区和日志后手动重试。";
+const QUEUE_PAUSED: &str =
+    "DevHub 重启后已暂停此会话，待执行任务已保留。请点击「继续执行」恢复队列。";
 
 #[derive(Clone)]
 pub struct Store {
@@ -21,17 +26,20 @@ pub struct Store {
     pub logs: PathBuf,
     pub worktrees: PathBuf,
     pub bus: broadcast::Sender<Value>,
+    _instance_lock: Arc<Mutex<Connection>>,
 }
 
 impl Store {
     pub fn open(data: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&data).with_context(|| format!("创建目录失败：{}", data.display()))?;
+        let instance_lock = acquire_instance_lock(&data)?;
         let prompts = data.join("prompts");
         let logs = data.join("logs");
         let worktrees = data.join("worktrees");
-        for d in [&data, &prompts, &logs, &worktrees] {
+        for d in [&prompts, &logs, &worktrees] {
             fs::create_dir_all(d).with_context(|| format!("创建目录失败：{}", d.display()))?;
         }
-        let db = Connection::open(data.join("devhub.db"))
+        let mut db = Connection::open(data.join("devhub.db"))
             .with_context(|| format!("打开数据库失败：{}", data.join("devhub.db").display()))?;
         db.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -82,6 +90,8 @@ impl Store {
                feedback TEXT DEFAULT '',
                summary TEXT DEFAULT '',
                diff_stat TEXT DEFAULT '',
+               result_sha TEXT NOT NULL DEFAULT '',
+               reject_count INTEGER NOT NULL DEFAULT 0,
                created_at TEXT NOT NULL,
                updated_at TEXT NOT NULL
              );
@@ -95,7 +105,8 @@ impl Store {
                log_path TEXT DEFAULT '',
                error TEXT DEFAULT '',
                started_at TEXT NOT NULL,
-               ended_at TEXT
+               ended_at TEXT,
+               flow_json TEXT NOT NULL DEFAULT ''
              );
              CREATE TABLE IF NOT EXISTS events (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,6 +137,7 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_events_room ON events(room_id, id);",
         )
         .context("初始化数据库 schema 失败")?;
+        recover_interrupted_work(&mut db).context("恢复上次执行状态失败")?;
         let (bus, _) = broadcast::channel(2048);
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
@@ -134,6 +146,7 @@ impl Store {
             logs,
             worktrees,
             bus,
+            _instance_lock: Arc::new(Mutex::new(instance_lock)),
         })
     }
 
@@ -162,6 +175,36 @@ impl Store {
         out
     }
 
+    pub(crate) fn record_event(
+        conn: &Connection,
+        room_id: Option<&str>,
+        task_id: Option<&str>,
+        run_id: Option<&str>,
+        type_: &str,
+        payload: Value,
+    ) -> Result<Value> {
+        let created = now();
+        let inserted = conn.execute(
+            "INSERT INTO events (room_id, task_id, run_id, type, payload, created_at) VALUES (?,?,?,?,?,?)",
+            params![room_id, task_id, run_id, type_, payload.to_string(), created],
+        )?;
+        anyhow::ensure!(inserted == 1, "事件没有写入数据库");
+        Ok(json!({
+            "kind": "event",
+            "id": conn.last_insert_rowid(),
+            "room_id": room_id,
+            "task_id": task_id,
+            "run_id": run_id,
+            "type": type_,
+            "payload": payload,
+            "created_at": created,
+        }))
+    }
+
+    pub(crate) fn publish_event(&self, event: Value) {
+        let _ = self.bus.send(event);
+    }
+
     pub fn emit(
         &self,
         room_id: Option<&str>,
@@ -170,26 +213,13 @@ impl Store {
         type_: &str,
         payload: Value,
     ) {
-        let created = now();
-        let id = {
+        let event = {
             let conn = self.db.lock().unwrap();
-            let _ = conn.execute(
-                "INSERT INTO events (room_id, task_id, run_id, type, payload, created_at) VALUES (?,?,?,?,?,?)",
-                params![room_id, task_id, run_id, type_, payload.to_string(), created],
-            );
-            conn.last_insert_rowid()
+            Self::record_event(&conn, room_id, task_id, run_id, type_, payload)
         };
-        let ev = json!({
-            "kind": "event",
-            "id": id,
-            "room_id": room_id,
-            "task_id": task_id,
-            "run_id": run_id,
-            "type": type_,
-            "payload": payload,
-            "created_at": created,
-        });
-        let _ = self.bus.send(ev);
+        if let Ok(event) = event {
+            self.publish_event(event);
+        }
     }
 
     pub fn log(
@@ -374,6 +404,108 @@ impl Store {
             "running": running,
         })))
     }
+}
+
+fn acquire_instance_lock(data: &Path) -> Result<Connection> {
+    let path = data.join("devhub.instance.sqlite");
+    let lock =
+        Connection::open(&path).with_context(|| format!("打开实例锁失败：{}", path.display()))?;
+    lock.busy_timeout(Duration::ZERO)?;
+    // The open transaction is held through the lifetime of all Store clones.
+    if let Err(error) = lock.execute_batch("BEGIN EXCLUSIVE") {
+        let message = match error.sqlite_error_code() {
+            Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => format!(
+                "数据目录已被另一个 DevHub 实例使用：{}。请停止该实例或选择其他数据目录。",
+                data.display()
+            ),
+            _ => format!("获取实例锁失败：{}", path.display()),
+        };
+        return Err(error).context(message);
+    }
+    Ok(lock)
+}
+
+fn recover_interrupted_work(db: &mut Connection) -> Result<()> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let has_result_sha: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('tasks') WHERE name='result_sha')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_result_sha {
+        tx.execute(
+            "ALTER TABLE tasks ADD COLUMN result_sha TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    // 旧库补打回计数列；已发生的 agent 打回从评审记录回填，人工打回没有结构化历史，从 0 开始。
+    let has_reject_count: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('tasks') WHERE name='reject_count')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_reject_count {
+        tx.execute(
+            "ALTER TABLE tasks ADD COLUMN reject_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE tasks SET reject_count=(
+               SELECT COUNT(*) FROM reviews r WHERE r.task_id=tasks.id AND r.verdict='request_changes')",
+            [],
+        )?;
+    }
+
+    // Runs written before the flow snapshot migration keep an empty flow_json.
+    let has_run_flow: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('runs') WHERE name='flow_json')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_run_flow {
+        tx.execute(
+            "ALTER TABLE runs ADD COLUMN flow_json TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+
+    // Write recovery events directly to SQLite in the same transaction as the state changes.
+    let ts = now();
+    let run_payload = json!({ "status": "interrupted", "reason": INTERRUPTED });
+    tx.execute(
+        "INSERT INTO events (room_id, task_id, run_id, type, payload, created_at)
+         SELECT t.room_id, r.task_id, r.id, 'run.interrupted', ?, ?
+         FROM runs r LEFT JOIN tasks t ON t.id=r.task_id WHERE r.status='running'",
+        params![run_payload.to_string(), ts],
+    )?;
+    tx.execute(
+        "UPDATE runs SET status='interrupted', error=?, ended_at=? WHERE status='running'",
+        params![INTERRUPTED, ts],
+    )?;
+
+    let task_payload = json!({ "status": "failed", "reason": INTERRUPTED });
+    tx.execute(
+        "INSERT INTO events (room_id, task_id, type, payload, created_at)
+         SELECT room_id, id, 'task.interrupted', ?, ? FROM tasks WHERE status='running'",
+        params![task_payload.to_string(), ts],
+    )?;
+    tx.execute(
+        "UPDATE tasks SET status='failed', summary=?, updated_at=? WHERE status='running'",
+        params![INTERRUPTED, ts],
+    )?;
+
+    let room_payload = json!({ "status": "paused", "reason": QUEUE_PAUSED });
+    tx.execute(
+        "INSERT INTO events (room_id, type, payload, created_at)
+         SELECT id, 'room.recovered', ?, ? FROM rooms WHERE status='running'",
+        params![room_payload.to_string(), ts],
+    )?;
+    tx.execute(
+        "UPDATE rooms SET status='paused', updated_at=? WHERE status='running'",
+        params![ts],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn valid_env_key(k: &str) -> bool {

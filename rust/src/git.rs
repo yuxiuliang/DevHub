@@ -99,13 +99,51 @@ pub async fn diff_stat(path: &str, base_sha: &str) -> String {
         .unwrap_or_default()
 }
 
+pub async fn commit_sha(repo: &str, reference: &str) -> Result<String> {
+    let sha = git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{}^{{commit}}", reference),
+        ],
+    )
+    .await?
+    .0;
+    if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("Git 没有返回有效提交，请检查任务分支后重试");
+    }
+    Ok(sha.to_ascii_lowercase())
+}
+
+pub async fn diff_commit(repo: &str, base_sha: &str, result_sha: &str) -> Result<String> {
+    // Resolve both references to commits before passing them as diff arguments.
+    let base = commit_sha(repo, base_sha).await?;
+    let result = commit_sha(repo, result_sha).await?;
+    Ok(git(
+        repo,
+        &["diff", "--no-color", "--no-ext-diff", &base, &result, "--"],
+    )
+    .await?
+    .0)
+}
+
+pub async fn tracked_status_checked(path: &str) -> Result<String> {
+    Ok(
+        git(path, &["status", "--porcelain", "--untracked-files=no"])
+            .await?
+            .0,
+    )
+}
+
 pub async fn merge_squash(
     repo: &str,
     base_branch: &str,
     branch: &str,
     message: &str,
 ) -> Result<()> {
-    let dirty = status_porcelain(repo).await;
+    let dirty = git(repo, &["status", "--porcelain"]).await?.0;
     if !dirty.is_empty() {
         let files = dirty.lines().take(5).collect::<Vec<_>>().join("；");
         bail!("仓库有未提交的改动，请先处理后再合并：{}", files);
@@ -115,21 +153,32 @@ pub async fn merge_squash(
         let _ = git(repo, &["reset", "--merge"]).await;
         bail!("合并冲突：{}", e.to_string().lines().next().unwrap_or(""));
     }
-    if let Err(e) = git(
-        repo,
-        &[
-            "-c",
-            "user.name=DevHub",
-            "-c",
-            "user.email=devhub@local",
-            "commit",
-            "-m",
-            message,
-            "--no-verify",
-        ],
-    )
-    .await
-    {
+    let commit_result: Result<()> = async {
+        // A previous merge may have committed before its task status was saved.
+        let staged_tree = git(repo, &["write-tree"]).await?.0;
+        let head_tree = git(repo, &["rev-parse", "--verify", "HEAD^{tree}"]).await?.0;
+        if staged_tree == head_tree {
+            git(repo, &["reset", "--merge"]).await?;
+            return Ok(());
+        }
+        git(
+            repo,
+            &[
+                "-c",
+                "user.name=DevHub",
+                "-c",
+                "user.email=devhub@local",
+                "commit",
+                "-m",
+                message,
+                "--no-verify",
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = commit_result {
         let _ = git(repo, &["reset", "--merge"]).await;
         bail!(
             "合并提交失败：{}",
