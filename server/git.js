@@ -42,6 +42,17 @@ export async function revParse(repo, ref) {
   return stdout;
 }
 
+export async function commitSha(repo, ref = 'HEAD') {
+  const { stdout } = await git(repo, ['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`]);
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(stdout)) throw new Error('无法解析完整 Git 提交，请检查任务分支后重试');
+  return stdout.toLowerCase();
+}
+
+export async function diffCommit(repo, baseSha, resultSha) {
+  const { stdout } = await git(repo, ['diff', '--no-color', baseSha, resultSha]);
+  return stdout;
+}
+
 export async function addWorktree(repo, path, branch, base) {
   try {
     await git(repo, ['worktree', 'remove', '--force', path]);
@@ -118,7 +129,7 @@ export async function mergeSquash(repo, baseBranch, branch, message) {
   const dirty = await statusPorcelain(repo);
   if (dirty) {
     const files = dirty.split('\n').slice(0, 5).join('；');
-    throw new Error(`仓库有未提交的改动，请先处理后再合并：${files}`);
+    throw new Error(`仓库有未提交的改动，请先提交、stash 保存或保留并处理这些改动，再重试合并：${files}`);
   }
   await git(repo, ['checkout', baseBranch]);
   try {
@@ -127,9 +138,17 @@ export async function mergeSquash(repo, baseBranch, branch, message) {
     try {
       await git(repo, ['reset', '--merge']);
     } catch {}
-    throw new Error(`合并冲突：${String(e.stderr || e.message).split('\n')[0]}`);
+    throw new Error(`合并冲突：${String(e.stderr || e.message).split('\n')[0]}。请先检查基准仓库的 git status，保留并处理冲突；需要修改成果时打回任务重跑，再查看新 Diff 后合并`);
   }
   try {
+    // A prior squash may already be committed even if saving the task failed.
+    // Compare exact trees so Git diff settings cannot hide staged changes.
+    const stagedTree = (await git(repo, ['write-tree'])).stdout;
+    const headTree = (await git(repo, ['rev-parse', '--verify', 'HEAD^{tree}'])).stdout;
+    if (stagedTree === headTree) {
+      await git(repo, ['reset', '--merge']);
+      return;
+    }
     await git(repo, [
       '-c', 'user.name=DevHub',
       '-c', 'user.email=devhub@local',
@@ -137,7 +156,7 @@ export async function mergeSquash(repo, baseBranch, branch, message) {
     ]);
   } catch (e) {
     try { await git(repo, ['reset', '--merge']); } catch {}
-    throw new Error(`合并提交失败：${String(e.stderr || e.message).split('\n')[0]}`);
+    throw new Error(`合并提交失败：${String(e.stderr || e.message).split('\n')[0]}。请检查基准仓库的 git status、签名或磁盘错误后重试合并`);
   }
 }
 

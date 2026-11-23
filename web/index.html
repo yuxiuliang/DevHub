@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>DevHub · 多 agent 协作台</title>
+  <title>DevHub · 项目协作</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
@@ -13,23 +13,24 @@
         <div class="mark">DH</div>
         <div class="brand-text">
           <b>DevHub</b>
-          <span>多 agent 协作台</span>
+          <span>本机项目协作</span>
         </div>
       </div>
-      <button class="btn primary block" id="btn-new-room" data-act="new-room">＋ 新建会话</button>
+      <button class="btn sm block" id="btn-new-room" data-act="new-room">新建会话</button>
+      <button class="btn sm danger block stop-all" id="btn-stop-all" data-act="stop-all" title="停止执行中的任务、计划和检查；受影响的会话会暂停，队列和工作区会保留。" hidden>停止所有运行</button>
+      <button class="rail-overview" data-act="open-overview">总览 <span id="inbox-count" class="inbox-count" aria-hidden="true" hidden></span></button>
       <div class="rail-label">会话 <button class="rail-toggle" id="btn-archived" data-act="toggle-archived">显示归档</button></div>
-      <div class="room-list" id="room-list"></div>
-      <div class="rail-foot">
-        <div class="rail-label">Worker</div>
+      <nav class="room-list" id="room-list" aria-label="会话"></nav>
+      <details class="rail-foot">
+        <summary>本机协作工具<span id="worker-summary-state" class="worker-summary-state" role="status" aria-live="polite">正在检测…</span></summary>
         <div class="worker-list" id="worker-list"></div>
-        <div class="rail-hint">检测自本机 PATH</div>
-      </div>
+      </details>
     </aside>
     <main id="main"></main>
   </div>
   <div id="modal-root"></div>
   <div id="drawer-root"></div>
-  <div id="toast-root" class="toasts"></div>
+  <div id="toast-root" class="toasts" aria-live="polite" aria-atomic="false"></div>
   <script src="/app.js" type="module"></script>
 </body>
 </html>

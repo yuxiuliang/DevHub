@@ -9,6 +9,10 @@ agy-help.txt
 # Rust 构建产物
 rust/target/
 
+# Python 浏览器测试缓存
+__pycache__/
+*.pyc
+
 # 本地进度/审计记录（含本机路径与会话 ID），不提交
 PROGRESS.md
 

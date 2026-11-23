@@ -38,28 +38,35 @@ export const WORKER_DEFS = {
   },
 };
 
-/**
- * 写进 .cmd 文件的参数转义。
- *
- * 不能把整条命令行交给 Node 的 spawn 去拼：Node 会用 \" 转义内层引号，
- * 而 cmd.exe 不认 \"，会在第一个内层引号处把参数截断。
- * 因此这里自己写一个 .cmd 文件，让 cmd 直接解析我们自己控制的引号。
- * 参数里不允许出现引号，其余 cmd 元字符只有在引号外才需要转义。
- */
-function cmdQuote(s) {
-  const v = String(s).replace(/"/g, '');
-  if (v === '') return '""';
-  if (!/[\s&|<>^()%!]/.test(v)) return v;
-  return '"' + v + '"';
+/** 批处理参数始终作为单个带引号的值；不能可靠透传的字符直接报错。 */
+function cmdQuote(value) {
+  const s = String(value);
+  if (/["%\p{Cc}]/u.test(s)) {
+    throw new Error('Windows 批处理路径或参数不支持引号、百分号及控制字符');
+  }
+  // npm shim 用 %* 把参数转给原生程序，尾部反斜杠需遵循 Windows argv 规则。
+  return '"' + s.replace(/(\\+)$/, '$1$1') + '"';
 }
 
 function writeLauncher(runId, exe, args) {
   const file = join(PROMPTS, `${runId}.cmd`);
-  const line = [exe, ...args.map(cmdQuote)].join(' ');
-  // 启动脚本必须保持纯 ASCII：cmd 按控制台 ANSI 代码页读取 .cmd，
-  // 中文 prompt 走独立的 UTF-8 prompt 文件，不进命令行。
-  writeFileSync(file, `@echo off\r\n${line}\r\n`, 'utf8');
+  cmdQuote(file);
+  const line = [exe, ...args].map(cmdQuote).join(' ');
+  // 在读取含中文路径的下一行之前切换到 UTF-8；关闭 ! 的延迟展开。
+  writeFileSync(file, `@echo off\r\nsetlocal DisableDelayedExpansion\r\nchcp 65001 >nul\r\n${line}\r\n`, 'utf8');
   return file;
+}
+
+function workerCommand(runId, exe, args) {
+  if (process.platform !== 'win32' || /\.exe$/i.test(exe)) {
+    return { command: exe, args, windowsVerbatimArguments: false };
+  }
+  const launcher = writeLauncher(runId, exe, args);
+  return {
+    command: process.env.ComSpec || 'cmd.exe',
+    args: ['/d', '/s', '/v:off', '/c', `""${launcher}""`],
+    windowsVerbatimArguments: true,
+  };
 }
 
 function stripAnsi(s) {
@@ -283,7 +290,7 @@ export function runWorker(opts) {
 
   const instruction = INSTRUCTION(promptPath);
   const { exe, args } = buildCommand(worker, { instruction, model, autoApprove });
-  const launcher = writeLauncher(runId, exe, args);
+  const launch = workerCommand(runId, exe, args);
 
   const acc = {
     text: '', final: '', session: '', usage: null, cost: null,
@@ -291,9 +298,10 @@ export function runWorker(opts) {
   };
   const handle = makeHandler(worker, acc);
 
-  const child = spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/c', launcher], {
+  const child = spawn(launch.command, launch.args, {
     cwd,
     windowsHide: true,
+    windowsVerbatimArguments: launch.windowsVerbatimArguments,
     env: { ...process.env, ...workerEnv(), NO_COLOR: '1', FORCE_COLOR: '0', CI: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });

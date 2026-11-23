@@ -1,13 +1,10 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { join, extname, normalize } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { dirname } from 'node:path';
 import { handleApi } from './api.js';
-import { ROOT } from './store.js';
+import { DATA, ROOT, openStore } from './store.js';
 import { detectWorkers } from './adapters.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB = join(ROOT, 'web');
 const PORT = Number(process.env.PORT || 7373);
 
@@ -48,14 +45,20 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '127.0.0.1', async () => {
-  // 启动时探测一次，让 dsh 这类不在 PATH 上的 CLI 也能被解析到绝对路径
-  detectWorkers().catch(() => {});
-  console.log('');
-  console.log('  DevHub 已启动');
-  console.log(`  http://127.0.0.1:${PORT}`);
-  console.log('');
-  console.log('  数据目录: ' + join(ROOT, '.data'));
-  console.log('  Ctrl+C 停止');
-  console.log('');
-});
+try {
+  openStore();
+  server.listen(PORT, '127.0.0.1', () => {
+    // 启动时探测一次，让 dsh 这类不在 PATH 上的 CLI 也能被解析到绝对路径
+    detectWorkers().catch(() => {});
+    console.log('');
+    console.log('  DevHub 已启动');
+    console.log(`  http://127.0.0.1:${server.address().port}`);
+    console.log('');
+    console.log('  数据目录: ' + DATA);
+    console.log('  Ctrl+C 停止');
+    console.log('');
+  });
+} catch (error) {
+  console.error(`DevHub 启动失败：${error.message}`);
+  process.exitCode = 1;
+}

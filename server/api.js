@@ -2,6 +2,9 @@ import { all, get, run, emit, now, uid, bus, safeJson, flowTemplateList } from '
 import * as E from './engine.js';
 import { detectWorkers } from './adapters.js';
 import { browseDir } from './fs.js';
+import { listInbox } from './inbox.js';
+import { taskLog } from './logs.js';
+import { taskPrompt } from './inputs.js';
 
 let workerCache = { at: 0, data: null };
 
@@ -23,11 +26,6 @@ function readBody(req) {
   });
 }
 
-function nextKey(roomId) {
-  const n = get('SELECT COUNT(*) c FROM tasks WHERE room_id=?', [roomId]).c || 0;
-  return 'T' + (n + 1);
-}
-
 export async function handleApi(req, res, url) {
   const p = url.pathname;
   if (!p.startsWith('/api/')) return false;
@@ -36,8 +34,12 @@ export async function handleApi(req, res, url) {
   try {
     if (p === '/api/health') return json(res, 200, { ok: true, at: now() }), true;
 
+    if (p === '/api/stop-all' && method === 'POST') {
+      return json(res, 200, { stopped: E.stopAll() }), true;
+    }
+
     if (p === '/api/workers') {
-      if (!workerCache.data || Date.now() - workerCache.at > 30000) {
+      if (!workerCache.data || url.searchParams.get('refresh') === '1' || Date.now() - workerCache.at > 30000) {
         workerCache = { at: Date.now(), data: await detectWorkers() };
       }
       return json(res, 200, { workers: workerCache.data }), true;
@@ -74,7 +76,13 @@ export async function handleApi(req, res, url) {
     }
 
     if (p === '/api/state' && method === 'GET') {
-      return json(res, 200, { rooms: E.listRooms(), running: E.runningTasks(), flowTemplates: flowTemplateList() }), true;
+      return json(res, 200, {
+        rooms: E.listRooms(),
+        running: E.runningTasks(),
+        activeWorkers: E.activeWorkerCount(),
+        flowTemplates: flowTemplateList(),
+        inbox: listInbox(),
+      }), true;
     }
 
     if (p === '/api/rooms' && method === 'POST') {
@@ -84,6 +92,14 @@ export async function handleApi(req, res, url) {
     }
 
     let m;
+
+    if ((m = p.match(/^\/api\/rooms\/([^/]+)\/settings$/))) {
+      if (method === 'GET') return json(res, 200, E.readSettings(m[1])), true;
+      if (method === 'PATCH') {
+        const body = await readBody(req);
+        return json(res, 200, E.saveSettings(m[1], body)), true;
+      }
+    }
 
     if ((m = p.match(/^\/api\/rooms\/([^/]+)$/))) {
       const id = m[1];
@@ -147,39 +163,38 @@ export async function handleApi(req, res, url) {
     }
 
     if (p === '/api/tasks' && method === 'POST') {
-      const b = await readBody(req);
-      const room = get('SELECT * FROM rooms WHERE id=?', [b.roomId]);
-      if (!room) return json(res, 404, { error: '房间不存在' }), true;
-      const id = uid('t');
-      const ts = now();
-      run(
-        `INSERT INTO tasks (id, room_id, key, title, spec, type, owner_id, status, deps_json, acceptance_json, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [id, b.roomId, nextKey(b.roomId), b.title || '新任务', b.spec || '', b.type || 'code',
-          b.ownerId || null, 'backlog', JSON.stringify(b.deps || []), JSON.stringify(b.acceptance || []), ts, ts],
-      );
-      emit(b.roomId, id, null, 'task.created', { title: b.title });
-      return json(res, 200, { id }), true;
+      const body = await readBody(req);
+      return json(res, 200, E.createTask(body)), true;
     }
 
-    if ((m = p.match(/^\/api\/tasks\/([^/]+)\/(run|review|merge|reject|retry|cancel)$/))) {
+    if ((m = p.match(/^\/api\/tasks\/([^/]+)\/(run|review|approve|merge|reject|retry|cancel)$/))) {
+      if (method !== 'POST') {
+        res.setHeader('Allow', 'POST');
+        return json(res, 405, { error: '此操作仅支持 POST 请求' }), true;
+      }
       const id = m[1];
       const action = m[2];
       const body = await readBody(req);
       if (action === 'run') return json(res, 200, await E.startTask(id)), true;
-      if (action === 'review') return json(res, 200, await E.reviewTask(id)), true;
-      if (action === 'merge') return json(res, 200, await E.mergeTask(id)), true;
+      if (action === 'review') return json(res, 200, await E.reviewTask(id, { resultSha: body.resultSha })), true;
+      if (action === 'approve') return json(res, 200, E.approveTask(id)), true;
+      if (action === 'merge') return json(res, 200, await E.mergeTask(id, { resultSha: body.resultSha })), true;
       if (action === 'reject') { E.rejectTask(id, body.note); return json(res, 200, { ok: true }), true; }
       if (action === 'retry') { E.retryTask(id); return json(res, 200, { ok: true }), true; }
       if (action === 'cancel') { E.cancelTask(id); return json(res, 200, { ok: true }), true; }
     }
 
     if ((m = p.match(/^\/api\/tasks\/([^/]+)\/diff$/)) && method === 'GET') {
-      return json(res, 200, { diff: await E.taskDiff(m[1]) }), true;
+      return json(res, 200, await E.taskDiff(m[1])), true;
+    }
+
+    if ((m = p.match(/^\/api\/tasks\/([^/]+)\/prompt$/)) && method === 'GET') {
+      const runId = url.searchParams.has('runId') ? url.searchParams.get('runId') : undefined;
+      return json(res, 200, await taskPrompt(m[1], runId)), true;
     }
 
     if ((m = p.match(/^\/api\/tasks\/([^/]+)\/log$/)) && method === 'GET') {
-      return json(res, 200, { log: E.taskLog(m[1]) }), true;
+      return json(res, 200, await taskLog(m[1])), true;
     }
 
     if (p === '/api/decisions' && method === 'POST') {
@@ -193,6 +208,6 @@ export async function handleApi(req, res, url) {
 
     return json(res, 404, { error: 'not found', path: p }), true;
   } catch (e) {
-    return json(res, 500, { error: String(e.message || e) }), true;
+    return json(res, e.statusCode || 500, { error: String(e.message || e) }), true;
   }
 }

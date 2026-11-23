@@ -1,21 +1,20 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, existsSync, readFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const ROOT = join(__dirname, '..');
-export const DATA = join(ROOT, '.data');
+export const DATA = resolve(process.env.DEVHUB_DATA || join(ROOT, '.data'));
 export const PROMPTS = join(DATA, 'prompts');
 export const LOGS = join(DATA, 'logs');
 export const WORKTREES = join(DATA, 'worktrees');
-for (const d of [DATA, PROMPTS, LOGS, WORKTREES]) mkdirSync(d, { recursive: true });
 
-const db = new DatabaseSync(join(DATA, 'devhub.db'));
-db.exec('PRAGMA journal_mode=WAL');
-db.exec(`
+const INTERRUPTED = 'DevHub 重启中断了上次运行。请检查工作区和日志后手动重试。';
+const QUEUE_PAUSED = 'DevHub 重启后已暂停此会话，待执行任务已保留。请点击「继续执行」恢复队列。';
+const SCHEMA = `
 CREATE TABLE IF NOT EXISTS rooms (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -62,6 +61,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   feedback TEXT DEFAULT '',
   summary TEXT DEFAULT '',
   diff_stat TEXT DEFAULT '',
+  result_sha TEXT NOT NULL DEFAULT '',
+  reject_count INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -74,6 +75,7 @@ CREATE TABLE IF NOT EXISTS runs (
   exit_code INTEGER,
   log_path TEXT DEFAULT '',
   error TEXT DEFAULT '',
+  flow_json TEXT NOT NULL DEFAULT '',
   started_at TEXT NOT NULL,
   ended_at TEXT
 );
@@ -104,7 +106,50 @@ CREATE TABLE IF NOT EXISTS reviews (
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_room ON tasks(room_id);
 CREATE INDEX IF NOT EXISTS idx_events_room ON events(room_id, id);
-`);
+`;
+
+let db;
+let transactionEvents = null;
+
+export function openStore() {
+  if (db) return;
+  mkdirSync(DATA, { recursive: true });
+  const lock = new DatabaseSync(join(DATA, 'devhub.instance.sqlite'));
+  try {
+    // Keep this transaction open on a separate database for the whole service lifetime.
+    lock.exec('BEGIN EXCLUSIVE');
+  } catch (error) {
+    lock.close();
+    if (error.errcode === 5 || error.errcode === 6) {
+      throw new Error(`数据目录已被另一个 DevHub 实例使用：${DATA}。请停止该实例或选择其他数据目录。`, { cause: error });
+    }
+    throw error;
+  }
+
+  try {
+    for (const dir of [PROMPTS, LOGS, WORKTREES]) mkdirSync(dir, { recursive: true });
+    db = new DatabaseSync(join(DATA, 'devhub.db'));
+    db.exec('PRAGMA journal_mode=WAL');
+    db.exec(SCHEMA);
+    recoverInterruptedWork();
+  } catch (error) {
+    try {
+      db?.close();
+    } finally {
+      db = undefined;
+      lock.close();
+    }
+    throw error;
+  }
+
+  process.once('exit', () => {
+    try {
+      db.close();
+    } finally {
+      lock.close();
+    }
+  });
+}
 
 export const bus = new EventEmitter();
 bus.setMaxListeners(0);
@@ -113,13 +158,79 @@ export const now = () => new Date().toISOString();
 export const uid = (p) => `${p}_${randomUUID().slice(0, 8)}`;
 
 export function all(sql, params = []) {
+  openStore();
   return db.prepare(sql).all(...params);
 }
 export function get(sql, params = []) {
+  openStore();
   return db.prepare(sql).get(...params);
 }
 export function run(sql, params = []) {
+  openStore();
   return db.prepare(sql).run(...params);
+}
+
+export function transaction(callback) {
+  openStore();
+  db.exec('BEGIN IMMEDIATE');
+  const events = [];
+  transactionEvents = events;
+  let result;
+  try {
+    result = callback();
+    db.exec('COMMIT');
+  } catch (error) {
+    try { db.exec('ROLLBACK'); } catch {}
+    throw error;
+  } finally {
+    transactionEvents = null;
+  }
+  // Readers must never receive a state that can still roll back.
+  for (const event of events) publishEvent(event);
+  return result;
+}
+
+// Write recovery events directly to SQLite so startup either commits all changes or none.
+function recoverInterruptedWork() {
+  transaction(() => {
+    if (!all('PRAGMA table_info(tasks)').some((column) => column.name === 'result_sha')) {
+      db.exec("ALTER TABLE tasks ADD COLUMN result_sha TEXT NOT NULL DEFAULT ''");
+    }
+    // 旧库补流程快照列；旧运行保持空串（接口返回 flow:null），不回填历史数据。
+    if (!all('PRAGMA table_info(runs)').some((column) => column.name === 'flow_json')) {
+      db.exec("ALTER TABLE runs ADD COLUMN flow_json TEXT NOT NULL DEFAULT ''");
+    }
+    // 旧库补打回计数列；已发生的 agent 打回从评审记录回填，人工打回没有结构化历史，从 0 开始。
+    if (!all('PRAGMA table_info(tasks)').some((column) => column.name === 'reject_count')) {
+      db.exec('ALTER TABLE tasks ADD COLUMN reject_count INTEGER NOT NULL DEFAULT 0');
+      db.exec(`UPDATE tasks SET reject_count=(
+        SELECT COUNT(*) FROM reviews r WHERE r.task_id=tasks.id AND r.verdict='request_changes')`);
+    }
+    const ts = now();
+    run(`INSERT INTO events (room_id, task_id, run_id, type, payload, created_at)
+         SELECT t.room_id, r.task_id, r.id, 'run.interrupted', ?, ?
+         FROM runs r LEFT JOIN tasks t ON t.id=r.task_id WHERE r.status='running'`,
+    [JSON.stringify({ status: 'interrupted', reason: INTERRUPTED }), ts]);
+    run("UPDATE runs SET status='interrupted', error=?, ended_at=? WHERE status='running'", [INTERRUPTED, ts]);
+
+    run(`INSERT INTO events (room_id, task_id, type, payload, created_at)
+         SELECT room_id, id, 'task.interrupted', ?, ? FROM tasks WHERE status='running'`,
+    [JSON.stringify({ status: 'failed', reason: INTERRUPTED }), ts]);
+    run("UPDATE tasks SET status='failed', summary=?, updated_at=? WHERE status='running'", [INTERRUPTED, ts]);
+
+    run(`INSERT INTO events (room_id, type, payload, created_at)
+         SELECT id, 'room.recovered', ?, ? FROM rooms WHERE status='running'`,
+    [JSON.stringify({ status: 'paused', reason: QUEUE_PAUSED }), ts]);
+    run("UPDATE rooms SET status='paused', updated_at=? WHERE status='running'", [ts]);
+  });
+}
+
+function publishEvent(event) {
+  // One broken consumer must not fail a committed write or starve other clients.
+  for (const listener of bus.rawListeners('event')) {
+    try { listener.call(bus, event); }
+    catch (error) { console.error('DevHub 事件通知失败：', error); }
+  }
 }
 
 export function emit(roomId, taskId, runId, type, payload = {}) {
@@ -136,8 +247,10 @@ export function emit(roomId, taskId, runId, type, payload = {}) {
     `INSERT INTO events (room_id, task_id, run_id, type, payload, created_at) VALUES (?,?,?,?,?,?)`,
     [evt.room_id, evt.task_id, evt.run_id, evt.type, JSON.stringify(payload), evt.created_at],
   );
+  if (Number(r.changes) !== 1) throw new Error('事件没有写入数据库');
   evt.id = Number(r.lastInsertRowid);
-  bus.emit('event', evt);
+  if (transactionEvents) transactionEvents.push(evt);
+  else publishEvent(evt);
   return evt;
 }
 
