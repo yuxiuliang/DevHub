@@ -367,6 +367,7 @@ main { display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
 .flow-snapshot-list li { padding: 1px 0; }
 .flow-snapshot-phases { list-style: none; padding-left: 0; }
 .diff-box { font: 11.5px/1.6 var(--mono); background: #fbfaf6; border: 1px solid var(--line); border-radius: 9px; padding: 12px 14px; overflow: auto; max-height: 58vh; white-space: pre; }
+.diff-box:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 .diff-box .add { color: #116b3f; background: #eaf6ee; display: block; }
 .diff-box .del { color: #a12a20; background: #fbeceb; display: block; }
 .diff-box .hunk { color: #1d4ed8; display: block; }

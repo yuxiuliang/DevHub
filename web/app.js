@@ -4,6 +4,7 @@ import { cloneDraft, createDraftCache, sameValue } from './edit-drafts.js';
 
 const settingsDrafts = createDraftCache('devhub.settings-draft.');
 const flowDrafts = createDraftCache('devhub.flow-draft.');
+const planDrafts = createDraftCache('devhub.plan-draft.');
 const flowSaves = new Set();
 let settingsRequest = 0;
 let newMemberSequence = 0;
@@ -49,14 +50,15 @@ const state = {
   roomLoading: false, roomError: '', roomNavigation: 0, roomRequest: 0,
   initialLoaded: false, initialLoading: true, initialLoadError: '',
   workerStatus: 'checking', workerError: '',
-  planRoomId: null, planEdits: new Map(), generatingPlans: new Set(), planErrors: new Map(), startErrors: new Map(), startingRooms: new Set(), applyingPlan: false,
+  planRoomId: null, planDraft: null, planSource: null, planBase: null, planDraftRecovered: false, planDraftStale: false,
+  generatingPlans: new Set(), planErrors: new Map(), startErrors: new Map(), startingRooms: new Set(), applyingPlan: false,
   tab: 'board',
   selectedTaskId: null,
+  drawerInvokerTaskId: null, drawerInvoker: null,
   drawerTab: 'overview',
   log: '', logMeta: null, logTruncated: false, logFollow: true,
   inputMeta: null, inputRunId: null, inputFocus: false,
   diff: '', resultSha: '', drawerLoad: '', drawerError: '', drawerNotice: '', taskAction: new Map(),
-  planDraft: null,
   settingsEditor: null,
   flowSelected: null,
   flowAdvanced: (() => { try { return localStorage.getItem('devhub.flowAdvanced') === '1'; } catch { return false; } })(),
@@ -296,7 +298,7 @@ function drawerSignature(t) {
 async function openRoom(id) {
   state.roomNavigation++;
   closeModal();
-  closeDrawer();
+  closeDrawer(false);
   state.roomId = id;
   state.room = null;
   state.roomLoading = Boolean(id);
@@ -435,6 +437,8 @@ function renderMain(force = false) {
   const fieldFocus = oldField ? { data: { ...oldField.dataset }, start: oldField.selectionStart, end: oldField.selectionEnd } : null;
   const focusedView = main.contains(document.activeElement) && document.activeElement.matches('button[data-act="tab"]')
     ? document.activeElement.dataset.tab : null;
+  const focusedTaskId = main.contains(document.activeElement) && document.activeElement.matches('button.card[data-act="open-task"]')
+    ? document.activeElement.dataset.id : null;
 
   main.innerHTML = renderRoom();
 
@@ -445,6 +449,9 @@ function renderMain(force = false) {
   wireFlow();
   if (focusedView) {
     $$('button[data-act="tab"]', main).find((button) => button.dataset.tab === focusedView)?.focus({ preventScroll: true });
+  }
+  if (focusedTaskId) {
+    $$('.card[data-act="open-task"]', main).find((button) => button.dataset.id === focusedTaskId)?.focus({ preventScroll: true });
   }
   if (state.tab === 'flow') {
     syncFlowStatus();
@@ -1337,9 +1344,11 @@ function cancelLogFrame() {
   logFrame = null;
 }
 
-function openTask(id, tab = 'overview') {
+function openTask(id, tab = 'overview', invoker = null) {
   drawerRequest?.abort();
   cancelLogFrame();
+  state.drawerInvokerTaskId = id;
+  state.drawerInvoker = invoker ? { element: invoker, data: { ...invoker.dataset }, card: invoker.classList.contains('card') } : null;
   state.selectedTaskId = id;
   state.drawerTab = 'overview';
   state.log = '';
@@ -1355,7 +1364,7 @@ function openTask(id, tab = 'overview') {
   setDrawerTab(tab);
 }
 
-function closeDrawer() {
+function closeDrawer(returnFocus = true) {
   drawerRequest?.abort();
   cancelLogFrame();
   $('#drawer-root dialog[open]')?.close();
@@ -1363,6 +1372,19 @@ function closeDrawer() {
   state.inputFocus = false;
   state.drawerSig = '';
   $('#drawer-root').replaceChildren();
+  const taskId = state.drawerInvokerTaskId;
+  const invoker = state.drawerInvoker;
+  state.drawerInvokerTaskId = null;
+  state.drawerInvoker = null;
+  if (returnFocus && taskId) {
+    const main = $('#main');
+    const replacement = invoker && $$('button[data-act]', main).find((button) =>
+      button.classList.contains('card') === invoker.card &&
+      Object.entries(invoker.data).every(([key, value]) => button.dataset[key] === value));
+    const target = invoker?.element.isConnected ? invoker.element : replacement ||
+      $$('.card[data-act="open-task"]', main).find((button) => button.dataset.id === taskId);
+    target?.focus({ preventScroll: true });
+  }
 }
 
 /** 执行依据按选中的运行读取；没选时交给后端取最新一次。 */
@@ -1587,7 +1609,7 @@ function renderDrawer(force = false) {
     </section>`;
   } else if (state.drawerTab === 'diff') {
     body = state.diff
-      ? `<div class="diff-box">${colorDiff(state.diff)}</div>`
+      ? `<div class="diff-box" tabindex="0" aria-label="任务改动">${colorDiff(state.diff)}</div>`
       : `<div class="center">这个任务还没有可查看的改动。</div>`;
   } else {
     body = reviews.length ? reviews.map((rv) => {
@@ -1662,6 +1684,16 @@ function renderDrawer(force = false) {
     });
     root.appendChild(dialog);
   }
+  const viewKey = JSON.stringify([t.id, state.drawerTab, state.drawerLoad,
+    state.drawerTab === 'input' ? state.inputMeta?.runId : state.drawerTab === 'diff' ? state.resultSha : null]);
+  const sameView = dialog.dataset.viewKey === viewKey;
+  const readingPositions = sameView ? ['.drawer-body', '.input-box', '.diff-box'].flatMap((selector) => {
+    const element = $(selector, dialog);
+    return element ? [{ selector, top: element.scrollTop, left: element.scrollLeft }] : [];
+  }) : [];
+  const inputHadFocus = sameView && document.activeElement === $('.input-box', dialog);
+  const diffHadFocus = sameView && document.activeElement === $('.diff-box', dialog);
+  dialog.dataset.viewKey = viewKey;
   const focused = dialog.contains(document.activeElement) ? document.activeElement.dataset : null;
   const focusedInput = dialog.contains(document.activeElement) && document.activeElement.id === 'input-run-select';
   const oldLog = $('#log-box', dialog);
@@ -1705,6 +1737,17 @@ function renderDrawer(force = false) {
     if (select) {
       state.inputFocus = false;
       select.focus({ preventScroll: true });
+    }
+  } else if (inputHadFocus) {
+    $('.input-box', dialog)?.focus({ preventScroll: true });
+  } else if (diffHadFocus) {
+    $('.diff-box', dialog)?.focus({ preventScroll: true });
+  }
+  for (const position of readingPositions) {
+    const element = $(position.selector, dialog);
+    if (element) {
+      element.scrollTop = position.top;
+      element.scrollLeft = position.left;
     }
   }
 
@@ -1764,6 +1807,10 @@ function closeModal() {
   state.repoPicker = null;
   state.planDraft = null;
   state.planRoomId = null;
+  state.planSource = null;
+  state.planBase = null;
+  state.planDraftRecovered = false;
+  state.planDraftStale = false;
   root.replaceChildren();
 }
 
@@ -2384,15 +2431,72 @@ async function createManualTask(form) {
   await refreshState().catch(() => toast('任务已添加，状态更新失败，可刷新查看。', 'err'));
 }
 
+function isCachedPlanDraft(draft) {
+  if (!draft || typeof draft !== 'object' || Array.isArray(draft) ||
+      typeof draft.summary !== 'string' || !Array.isArray(draft.decisions) || !draft.decisions.every((item) => typeof item === 'string') ||
+      !Array.isArray(draft.risks) || !draft.risks.every((item) => typeof item === 'string') ||
+      !Array.isArray(draft.tasks) || !Number.isSafeInteger(draft.nextId) || draft.nextId < 1) return false;
+  const ids = new Set();
+  for (const task of draft.tasks) {
+    if (!task || typeof task !== 'object' || !Number.isSafeInteger(task.id) || task.id < 1 || ids.has(task.id) ||
+        typeof task.title !== 'string' || typeof task.spec !== 'string' || typeof task.owner !== 'string' ||
+        !['code', 'document', 'research'].includes(task.type) || typeof task.phase !== 'string' ||
+        !Array.isArray(task.acceptance) || !task.acceptance.every((item) => typeof item === 'string') ||
+        !Array.isArray(task.dependencies) || !task.dependencies.every(Number.isSafeInteger) ||
+        typeof task.invalidDependencies !== 'boolean') return false;
+    ids.add(task.id);
+  }
+  const maxId = Math.max(0, ...ids);
+  return draft.nextId > maxId && draft.tasks.every((task) =>
+    task.dependencies.every((id) => id !== task.id && ids.has(id)));
+}
+
+function samePlanDraft(left, right) {
+  const comparable = cloneDraft(left);
+  comparable.nextId = right.nextId;
+  return sameValue(comparable, right);
+}
+
+function planDraftStatus() {
+  if (!state.planDraft || !state.planBase) return '';
+  if (state.planDraftRecovered) return '已恢复未确认的修改；确认前不会执行。';
+  if (!samePlanDraft(state.planDraft, state.planBase)) return '修改已暂存；确认前不会执行。';
+  if (state.planDraftStale) return '计划已更新，旧草稿已清除。';
+  return '';
+}
+
+function syncPlanDraftStatus() {
+  const note = $('#plan-form .plan-notice');
+  if (!note) return;
+  note.textContent = planDraftStatus();
+  note.hidden = !note.textContent;
+}
+
+function rememberPlanEdit() {
+  const { planRoomId, planSource, planDraft, planBase } = state;
+  if (!planRoomId || !planSource || !planDraft || !planBase) return;
+  state.planDraftRecovered = false;
+  state.planDraftStale = false;
+  if (samePlanDraft(planDraft, planBase)) {
+    planDrafts.delete(planRoomId);
+    return;
+  }
+  planDrafts.set(planRoomId, { source: planSource, draft: cloneDraft(planDraft) });
+}
+
 function openPlanModal(plan, roomId) {
   closeModal();
   state.planRoomId = roomId;
-  const source = JSON.stringify(plan);
-  const cached = state.planEdits.get(roomId);
-  state.planDraft = cached?.source === source ? cached.draft : createPlanDraft(plan);
-  state.planEdits.set(roomId, { source, draft: state.planDraft });
+  state.planSource = JSON.stringify(plan);
+  const cached = planDrafts.get(roomId);
+  const restored = cached?.source === state.planSource && isCachedPlanDraft(cached.draft);
+  state.planDraftRecovered = Boolean(restored);
+  state.planDraftStale = Boolean(cached && !restored);
+  if (cached && !restored) planDrafts.delete(roomId);
   const owner = state.members.find((member) => member.enabled)?.name || '';
-  for (const task of state.planDraft.tasks) task.owner ||= owner;
+  const baseDraft = createPlanDraft(plan, owner);
+  state.planBase = cloneDraft(baseDraft);
+  state.planDraft = restored ? cloneDraft(cached.draft) : cloneDraft(baseDraft);
   $('#modal-root').innerHTML = `<dialog class="modal wide plan-modal" aria-labelledby="plan-title">
     <form id="plan-form">
       <div class="modal-head"><h2 id="plan-title">确认计划</h2><button class="btn sm ghost x" type="button" data-act="close-modal" aria-label="关闭">✕</button></div>
@@ -2413,13 +2517,14 @@ function renderPlanModal(notice = '') {
   const phases = (state.room.flow?.nodes || []).filter((node) => node?.type === 'phase');
   const owners = (name) => `<option value="" disabled ${members.some((m) => m.name === name) ? '' : 'selected'}>请选择负责人</option>` +
     members.map((m) => `<option value="${esc(m.name)}" ${m.name === name ? 'selected' : ''}>${esc(m.name)}</option>`).join('');
+  const status = notice || planDraftStatus();
   body.innerHTML = `<p class="field-help">计划已生成，请检查任务标题、分工和验收条件；按需展开调整执行顺序。</p>
     <div class="plan-summary-row">
       ${p.summary ? `<p class="prose plan-summary">${esc(p.summary)}</p>` : ''}
       <button class="btn sm ghost" type="button" data-act="close-modal">稍后处理</button>
     </div>
     <p class="plan-progress">${p.tasks.length} 项任务 · ${p.tasks.filter((task) => task.dependencies.length).length} 项等待前置任务</p>
-    <p class="plan-notice" role="status" ${notice ? '' : 'hidden'}>${esc(notice)}</p>
+    <p class="plan-notice" role="status" ${status ? '' : 'hidden'}>${esc(status)}</p>
     <p class="form-error" id="plan-error" role="alert" hidden></p>
     ${p.tasks.map((t, i) => `<section class="plan-task" data-pt="${t.id}" aria-label="任务 ${i + 1}">
       <div class="pt-head"><span class="pt-key">任务 ${i + 1}</span>
@@ -2467,7 +2572,9 @@ function updatePlanTask(input) {
     task.acceptance = input.value.split('\n').map((line) => line.trim()).filter(Boolean);
   } else if (['title', 'spec', 'owner', 'type', 'phase'].includes(input.dataset.p)) {
     task[input.dataset.p] = input.value;
-  }
+  } else return;
+  rememberPlanEdit();
+  syncPlanDraftStatus();
 }
 
 async function startRoomExecution(roomId) {
@@ -2508,7 +2615,7 @@ async function applyPlan(form) {
   button.textContent = '正在确认并开始…';
   try {
     await api(`/api/rooms/${planRoomId}/plan/apply`, { method: 'POST', body: { plan: serializePlan(planDraft) } });
-    state.planEdits.delete(planRoomId);
+    planDrafts.delete(planRoomId);
     if (form.isConnected) closeModal();
     await refreshState();
     await startRoomExecution(planRoomId);
@@ -2571,7 +2678,7 @@ async function generateRoomPlan(roomId) {
   try {
     const { plan } = await api(`/api/rooms/${roomId}/plan`, { method: 'POST' });
     if (!Array.isArray(plan?.tasks)) throw new Error('协作工具没有返回可用的计划。');
-    state.planEdits.delete(roomId);
+    planDrafts.delete(roomId);
     if (state.room?.id === roomId) state.room.plan = plan;
     if (state.roomNavigation === navigation && !state.selectedTaskId && !$('#modal-root').children.length) {
       openPlanModal(plan, roomId);
@@ -2706,8 +2813,8 @@ async function act(el) {
     }
     if (a === 'drawer-tab') return setDrawerTab(el.dataset.tab);
     if (a === 'reload-drawer') return setDrawerTab(state.drawerTab);
-    if (a === 'open-task') return openTask(id);
-    if (a === 'open-result') return openTask(id, 'diff');
+    if (a === 'open-task') return openTask(id, 'overview', el);
+    if (a === 'open-result') return openTask(id, 'diff', el);
     if (a === 'plan-room') {
       const roomId = state.roomId;
       await generateRoomPlan(roomId);
@@ -2718,17 +2825,20 @@ async function act(el) {
       const taskId = Number(id);
       const affected = state.planDraft.tasks.filter((task) => task.dependencies.includes(taskId)).length;
       removePlanTask(state.planDraft, taskId);
+      rememberPlanEdit();
       renderPlanModal(affected ? `已更新 ${affected} 项任务的等待关系。` : '任务已移除。');
       $('[data-act="plan-add-task"]').focus();
       return;
     }
     if (a === 'clear-plan-invalid') {
       state.planDraft.tasks.find((t) => t.id === Number(id)).invalidDependencies = false;
+      rememberPlanEdit();
       renderPlanModal('已移除无效依赖。');
       return;
     }
     if (a === 'plan-add-task') {
       const task = addPlanTask(state.planDraft, state.members.find((m) => m.enabled)?.name || '');
+      rememberPlanEdit();
       renderPlanModal();
       $(`[data-pt="${task.id}"] [data-p="title"]`).focus();
       return;

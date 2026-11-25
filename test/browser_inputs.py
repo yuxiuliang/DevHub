@@ -11,7 +11,7 @@ from browser_cleanup import close_test_browser, launch_test_browser
 WEB = Path(__file__).resolve().parents[1] / 'web'
 STAMP = '2026-11-22T00:00:00.000Z'
 ROOM_ID = 'r_input'
-BIG = 'B' * 1000
+BIG = ('B' * 19 + '\n') * 50
 PROMPTS = {
     'run_new': ('最新一次输入：检查筛选\n'
                 '任务：在任务板增加按负责人筛选\n'
@@ -289,6 +289,20 @@ def main(screenshots=None):
             expect(picker).to_have_value('run_big')
             expect(picker).to_be_focused()
             assert dialog.get_by_label('当时保存的执行输入').evaluate('e => e.textContent') == BIG
+            assert len(prompt_requests()) == sent, prompt_requests()
+
+            # Reading long saved input must survive live status updates.
+            box.focus()
+            box.evaluate('e => { e.scrollTop = 250; }')
+            input_top = box.evaluate('e => e.scrollTop')
+            body = dialog.locator('.drawer-body')
+            body.evaluate('e => { e.scrollTop = e.scrollHeight; }')
+            body_top = body.evaluate('e => e.scrollTop')
+            assert input_top > 0 and body_top > 0, (input_top, body_top)
+            refresh()
+            expect(box).to_be_focused()
+            assert box.evaluate('e => e.scrollTop') == input_top
+            assert body.evaluate('e => e.scrollTop') == body_top
             assert len(prompt_requests()) == sent, prompt_requests()
 
             # Leaving the tab aborts the in-flight read; a late answer cannot win.

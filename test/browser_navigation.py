@@ -19,7 +19,7 @@ def main():
                 flow=dict(name="测试流程", nodes=[dict(id="n1", type="phase", name="实现", x=40, y=80,
                                                      owner="", gate="auto", outputs=[])], edges=[]))
     task = dict(id="t-nav", key="T1", title="检查导航", type="code", status="ready", owner_id="m1",
-                spec="检查焦点保留", deps=[], acceptance=[], summary="", diff_stat="", updated_at="initial")
+                spec="检查焦点保留\n" * 80, deps=[], acceptance=[], summary="", diff_stat="", updated_at="initial")
     held = []
     flags = dict(hold_log=False)
     errors, writes = [], []
@@ -48,7 +48,8 @@ def main():
                 return
             return route.fulfill(json=dict(log="读取成功\n", runId="run-nav", status="completed"))
         if path == "/api/tasks/t-nav/diff":
-            return route.fulfill(json=dict(diff="", resultSha=""))
+            return route.fulfill(json=dict(diff="@@ -1,80 +1,80 @@\n" + ("+" + "长改动内容" * 80 + "\n") * 80,
+                                           resultSha="a" * 40))
         return route.fulfill(status=404)
 
     with sync_playwright() as pw:
@@ -97,10 +98,20 @@ def main():
             refresh()
             expect(board).to_be_focused()
 
-            page.locator('.card[data-id="t-nav"]').press("Enter")
+            task_card = page.locator('.card[data-id="t-nav"]')
+            task_card.focus()
+            refresh()
+            expect(task_card).to_be_focused()
+            task_card.press("Enter")
             dialog = page.get_by_role("dialog", name="检查导航", exact=True)
             task_views = dialog.get_by_role("group", name="任务详情视图", exact=True)
             expect(task_views.get_by_role("button", name="概览", exact=True)).to_have_attribute("aria-pressed", "true")
+            drawer_body = dialog.locator('.drawer-body')
+            drawer_body.evaluate('e => { e.scrollTop = 300; }')
+            overview_top = drawer_body.evaluate('e => e.scrollTop')
+            assert overview_top > 0
+            refresh()
+            assert drawer_body.evaluate('e => e.scrollTop') == overview_top
             flags["hold_log"] = True
             log = task_views.get_by_role("button", name="日志", exact=True)
             log.press("Enter")
@@ -118,11 +129,55 @@ def main():
                 expect(button).to_have_attribute("aria-pressed", "true")
                 expect(task_views.locator('[aria-pressed="true"]')).to_have_count(1)
                 expect(button).to_be_focused()
+                if label == "改动":
+                    diff = dialog.locator('.diff-box')
+                    expect(diff).to_be_visible()
+                    diff.focus()
+                    expect(diff).to_be_focused()
+                    diff.evaluate('e => { e.scrollTop = 220; e.scrollLeft = 160; }')
+                    diff_position = diff.evaluate('e => [e.scrollTop, e.scrollLeft]')
+                    assert all(value > 0 for value in diff_position), diff_position
+                    refresh()
+                    expect(diff).to_be_focused()
+                    assert diff.evaluate('e => [e.scrollTop, e.scrollLeft]') == diff_position
+                else:
+                    assert drawer_body.evaluate('e => e.scrollTop') == 0, 'A different view starts at the top'
             refresh()
             expect(task_views.get_by_role("button", name="概览", exact=True)).to_be_focused()
             expect(board).not_to_be_focused()
             page.keyboard.press("Escape")
             expect(dialog).to_have_count(0)
+            expect(task_card).to_be_focused()
+
+            # Preserve the actual opener, including its replacement after SSE.
+            task['status'] = 'failed'
+            refresh()
+            opener = page.locator('.next-action button[data-act="open-task"]')
+            opener.press('Enter')
+            expect(dialog).to_be_visible()
+            page.keyboard.press('Escape')
+            expect(opener).to_be_focused()
+            opener.press('Enter')
+            refresh()
+            page.keyboard.press('Escape')
+            expect(opener).to_be_focused()
+
+            task.update(status='review', diff_stat=' result.txt | 1 +', result_sha='a' * 40)
+            refresh()
+            result_opener = page.locator('.next-action button[data-act="open-result"]')
+            result_opener.press('Enter')
+            expect(dialog.locator('.diff-box')).to_be_visible()
+            refresh()
+            page.keyboard.press('Escape')
+            expect(result_opener).to_be_focused()
+
+            # If the action disappears while viewing, return to the task card.
+            result_opener.press('Enter')
+            expect(dialog.locator('.diff-box')).to_be_visible()
+            task['status'] = 'done'
+            refresh()
+            page.keyboard.press('Escape')
+            expect(task_card).to_be_focused()
             assert not errors, errors
             assert not writes, writes
         finally:

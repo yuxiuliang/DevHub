@@ -28,6 +28,7 @@ def main():
     rooms = {}
     created = []
     applied = []
+    apply_attempts = Counter()
     plan_attempts = Counter()
     starts = []
     manual_created = []
@@ -82,6 +83,9 @@ def main():
                     return None
                 return route.fulfill(json={"plan": PLAN})
             if action == ["plan", "apply"]:
+                apply_attempts[room_id] += 1
+                if room_id == "r_one" and apply_attempts[room_id] == 1:
+                    return route.fulfill(status=500, json={"error": "确认暂时失败，请重试"})
                 applied.append(route.request.post_data_json["plan"])
                 data["room"]["plan"] = None
                 data["tasks"] = [dict(id="t_one", key="T1", status="ready", title="检查现状", owner_id="m_test", type="code")]
@@ -143,9 +147,51 @@ def main():
             expect(plan).to_be_visible()
             assert len(created) == 1 and plan_attempts["r_one"] == 2 and not starts
             plan.get_by_label("任务 3 标题").fill("实现新版筛选")
+            expect(plan.get_by_text("修改已暂存；确认前不会执行。", exact=True)).to_be_visible()
+            task_three = plan.locator('.plan-task[data-pt="3"]')
+            task_three.locator("summary").click()
+            task_three.locator('[data-p="spec"]').fill("保留重载前填写的实现说明")
+            task_three.locator('[data-p="type"]').select_option("document")
+            task_three.locator('[data-p="acceptance"]').fill("筛选结果正确\n回归检查通过")
             plan.get_by_role("button", name="移除任务 2").click()
             expect(plan.get_by_label("任务 2 标题")).to_have_value("实现新版筛选")
             assert not starts, "Plan editing must not execute tasks before confirmation"
+            page.keyboard.press("Escape")
+            expect(plan).to_have_count(0)
+            page.reload(wait_until="domcontentloaded")
+            expect(page.get_by_role("heading", name="添加订单筛选", exact=True)).to_be_visible()
+            page.get_by_role("button", name="确认计划", exact=True).click()
+            expect(plan.get_by_text("已恢复未确认的修改；确认前不会执行。", exact=True)).to_be_visible()
+            expect(plan.get_by_label("任务 2 标题")).to_have_value("实现新版筛选")
+            recovered_task = plan.locator('.plan-task[data-pt="3"]')
+            expect(recovered_task.locator('[data-p="spec"]')).to_have_value("保留重载前填写的实现说明")
+            recovered_task.locator("summary").click()
+            expect(recovered_task.locator('[data-p="type"]')).to_have_value("document")
+            expect(recovered_task.locator('[data-p="acceptance"]')).to_have_value("筛选结果正确\n回归检查通过")
+            expect(recovered_task.locator('[data-dep="1"]')).to_be_checked()
+            assert recovered_task.locator('[data-dep="2"]').count() == 0
+            assert not starts and not applied, "A restored draft must wait for explicit confirmation"
+            page.keyboard.press("Escape")
+            rooms["r_one"]["room"]["plan"] = {**PLAN, "summary": "服务端已更新的计划"}
+            page.reload(wait_until="domcontentloaded")
+            expect(page.get_by_role("heading", name="添加订单筛选", exact=True)).to_be_visible()
+            page.get_by_role("button", name="确认计划", exact=True).click()
+            expect(plan.get_by_text("计划已更新，旧草稿已清除。", exact=True)).to_be_visible()
+            expect(plan.get_by_label("任务 3 标题")).to_have_value("实现筛选")
+            plan.get_by_label("任务 3 标题").fill("实现新版筛选")
+            plan.get_by_role("button", name="移除任务 2").click()
+            expect(plan.get_by_label("任务 2 标题")).to_have_value("实现新版筛选")
+            assert not starts and not applied
+            plan.get_by_role("button", name="确认并开始执行", exact=True).click()
+            expect(plan.get_by_role("alert")).to_have_text("确认暂时失败，请重试")
+            expect(plan.get_by_label("任务 2 标题")).to_have_value("实现新版筛选")
+            assert not starts and not applied, "Failed confirmation must retain the draft without starting work"
+            page.reload(wait_until="domcontentloaded")
+            expect(page.get_by_role("heading", name="添加订单筛选", exact=True)).to_be_visible()
+            page.get_by_role("button", name="确认计划", exact=True).click()
+            expect(plan.get_by_text("已恢复未确认的修改；确认前不会执行。", exact=True)).to_be_visible()
+            expect(plan.get_by_label("任务 2 标题")).to_have_value("实现新版筛选")
+            assert not starts and not applied
             plan.get_by_role("button", name="确认并开始执行", exact=True).click()
             start = page.locator(".next-action").get_by_role("button", name="开始执行", exact=True)
             expect(start).to_be_visible()
@@ -153,6 +199,8 @@ def main():
             assert [task["dependsOn"] for task in applied[0]["tasks"]] == [[], [1], [2]]
             assert starts == ["r_one"], "Confirmation starts the existing room exactly once"
             assert len(created) == 1 and len(applied) == 1, "Failed start must retain the applied tasks"
+            assert apply_attempts["r_one"] == 2
+            assert page.evaluate("sessionStorage.getItem('devhub.plan-draft.r_one')") is None, "Successful confirmation must clear the saved draft"
             expect(page.get_by_role("heading", name="任务已准备好，但没有开始", exact=True)).to_be_visible()
             page.locator('.next-action[aria-label="执行未开始"] summary').click()
             expect(page.get_by_text("模拟启动暂时失败，请手动重试", exact=True)).to_be_visible()
